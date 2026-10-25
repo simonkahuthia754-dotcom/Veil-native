@@ -25,8 +25,19 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # `ubuntu-latest` GitHub-hosted runners already ship with an Android
+      # SDK preinstalled (ANDROID_HOME/ANDROID_SDK_ROOT set, `sdkmanager` on
+      # PATH) — that's the standard, documented setup for Android CI on
+      # these images. A previous version of this workflow instead used the
+      # third-party `android-actions/setup-android@v3` action, which failed
+      # outright ("Set up Android SDK" step, conclusion: failure) rather
+      # than installing anything. Dropped in favor of just accepting
+      # licenses and letting Gradle's own dependency resolution pull
+      # whichever compileSdk/buildTools version android/app/build.gradle.kts
+      # asks for — one less moving part, and the actual documented
+      # mechanism rather than a flaky wrapper around it.
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses > /dev/null || true
 
       # No gradlew wrapper jar is committed yet (this project was scaffolded
       # in an environment with no network access to generate one honestly —
