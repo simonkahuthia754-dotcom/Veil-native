@@ -1,0 +1,40 @@
+[package]
+name = "veil-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core crypto + local secure storage for Veil clients. No custom cryptography: every primitive here is a standard, widely-reviewed crate, not a hand-rolled algorithm."
+
+[dependencies]
+# Classical half of the hybrid key exchange — X25519 ECDH, from the
+# well-established dalek-cryptography project.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+# Post-quantum half: ML-KEM-768 (the NIST-standardized algorithm formerly
+# known as Kyber). Used ALONGSIDE X25519, never instead of it — a
+# classical+PQ hybrid is the real-world recommended transition path (the
+# same approach behind Signal's PQXDH and Chrome's post-quantum TLS), not a
+# PQ-only scheme nobody has had years to attack yet.
+ml-kem = "0.2"
+
+# Combines the two shared secrets into one symmetric key.
+hkdf = "0.12"
+sha2 = "0.10"
+
+# Authenticated encryption for both messages and local secret-at-rest
+# storage, keyed by the hybrid-derived secret above.
+chacha20poly1305 = "0.10"
+
+# Password/PIN/passphrase hashing — OWASP's current recommendation, the
+# same primitive the backend already uses server-side.
+argon2 = "0.5"
+
+rand_core = { version = "0.6", features = ["std"] }
+zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/target/
+Cargo.lock
+
+# Android / Gradle
+.gradle/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.keystore
+*.jks
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Never commit real vault/secret files if a dev runs the clients from a repo checkout
+*.vault
+veil.meta

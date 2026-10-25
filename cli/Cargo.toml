@@ -1,0 +1,21 @@
+[package]
+name = "veil-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Real terminal client for Veil. Talks to the veil-backend server over HTTPS/WebSocket, optionally through a Tor SOCKS5 proxy."
+
+[[bin]]
+name = "veil"
+path = "src/main.rs"
+
+[dependencies]
+veil-crypto = { path = "../crypto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+rpassword = "7"
+directories = "5"
+anyhow = "1"

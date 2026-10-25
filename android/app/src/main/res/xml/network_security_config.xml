@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pins Veil to real TLS, no plaintext, no debug-only cert overrides left
+  switched on in a release build. cleartextTrafficPermitted="false" is set
+  at the base level, so even a misconfigured backend URL (http:// instead
+  of https://) fails closed instead of silently sending data in the clear.
+  This does NOT implement certificate pinning to a specific backend cert —
+  that is a real, still-open gap (see README "Honest gaps" section), left
+  out here because pinning to a cert that changes on redeploy would brick
+  the app on every backend cert rotation without a pin-update mechanism,
+  which doesn't exist yet.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
