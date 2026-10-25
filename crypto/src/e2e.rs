@@ -27,7 +27,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
-use ml_kem::{kem::Kem, EncodedSizeUser, MlKem768};
+use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -51,8 +51,8 @@ pub enum E2eError {
 pub struct Identity {
     x_secret: XSecretKey,
     pub x_public: XPublicKey,
-    kem_dk: <MlKem768 as Kem>::DecapsulationKey,
-    pub kem_ek: <MlKem768 as Kem>::EncapsulationKey,
+    kem_dk: <MlKem768 as KemCore>::DecapsulationKey,
+    pub kem_ek: <MlKem768 as KemCore>::EncapsulationKey,
 }
 
 impl Identity {
@@ -105,7 +105,7 @@ pub fn seal(
     let recipient_x_public = XPublicKey::from(recipient_x);
     let classical_secret = sender.x_secret.diffie_hellman(&recipient_x_public);
 
-    let recipient_ek = <MlKem768 as Kem>::EncapsulationKey::from_bytes(
+    let recipient_ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(
         recipient_kem_ek.try_into().map_err(|_| E2eError::BadKey)?,
     );
     let (kem_ciphertext, pq_secret) =
@@ -136,7 +136,7 @@ pub fn open(recipient: &Identity, msg: &SealedMessage) -> Result<Vec<u8>, E2eErr
     let sender_x_public = XPublicKey::from(sender_x);
     let classical_secret = recipient.x_secret.diffie_hellman(&sender_x_public);
 
-    let kem_ct = <MlKem768 as Kem>::Ciphertext::from_bytes(
+    let kem_ct = <MlKem768 as KemCore>::Ciphertext::from_bytes(
         msg.kem_ciphertext
             .as_slice()
             .try_into()
