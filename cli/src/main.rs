@@ -40,17 +40,18 @@ fn build_http_client() -> Result<reqwest::Client> {
     if let Ok(proxy) = std::env::var("VEIL_SOCKS_PROXY") {
         // e.g. socks5h://127.0.0.1:9050 for Tor, same convention as the
         // backend's feed-ingest worker (TOR_SOCKS_URL).
-        builder = builder.proxy(reqwest::Proxy::all(proxy.as_str()).context("invalid VEIL_SOCKS_PROXY")?);
+        builder =
+            builder.proxy(reqwest::Proxy::all(proxy.as_str()).context("invalid VEIL_SOCKS_PROXY")?);
         println!("[veil] routing all requests through {proxy}");
     } else {
-        println!("[veil] no VEIL_SOCKS_PROXY set \u2014 connecting directly, not through Tor. Set VEIL_SOCKS_PROXY=socks5h://127.0.0.1:9050 to route through a local Tor daemon.");
+        println!("[veil] no VEIL_SOCKS_PROXY set — connecting directly, not through Tor. Set VEIL_SOCKS_PROXY=socks5h://127.0.0.1:9050 to route through a local Tor daemon.");
     }
     Ok(builder.build()?)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("veil \u2014 terminal client. Type `help` for commands.\n");
+    println!("veil — terminal client. Type `help` for commands.\n");
 
     let vault_path = data_dir()?.join("vault.bin");
     let http = build_http_client()?;
@@ -60,11 +61,11 @@ async fn main() -> Result<()> {
     let passphrase = rpassword::read_password()?;
 
     let store = SecureStore::open_or_create(&vault_path, &passphrase)
-        .context("failed to open local vault \u2014 wrong passphrase, or a corrupted/tampered store")?;
+        .context("failed to open local vault — wrong passphrase, or a corrupted/tampered store")?;
     let mut data: VaultData = store.load().unwrap_or_default();
 
     // App-lock state lives inside the same encrypted vault, keyed on the
-    // same passphrase used to open it \u2014 so "unlock the vault" and "pass
+    // same passphrase used to open it — so "unlock the vault" and "pass
     // the app lock" are the same action here, by design (one real secret,
     // not two independent ones to keep in sync). A standalone, separately-
     // configurable AppLock (duress passphrase + fail-count wipe) is wired
@@ -77,13 +78,13 @@ async fn main() -> Result<()> {
             // from_bytes constructor yet (keeping secret material inside
             // the type, generated once, is the safer default). Wiring
             // persistence through needs a small, deliberate addition to
-            // veil-crypto (a `Identity::from_secret_bytes` constructor) \u2014
+            // veil-crypto (a `Identity::from_secret_bytes` constructor) —
             // flagged here rather than worked around with an unsafe cast.
-            println!("[veil] NOTE: identity persistence needs Identity::from_secret_bytes in veil-crypto (TODO, see README) \u2014 generating a fresh identity for this session instead of reusing the stored one.");
+            println!("[veil] NOTE: identity persistence needs Identity::from_secret_bytes in veil-crypto (TODO, see README) — generating a fresh identity for this session instead of reusing the stored one.");
             Identity::generate()
         }
         _ => {
-            println!("[veil] generating a new hybrid identity (X25519 + ML-KEM-768)\u2026");
+            println!("[veil] generating a new hybrid identity (X25519 + ML-KEM-768)…");
             Identity::generate()
         }
     };
@@ -114,7 +115,7 @@ async fn main() -> Result<()> {
             "whoami" => {
                 match (&data.handle, &data.user_id) {
                     (Some(h), Some(id)) => println!("logged in as {h} ({id})"),
-                    _ => println!("not logged in \u2014 use `register <handle>` or `login <handle>`"),
+                    _ => println!("not logged in — use `register <handle>` or `login <handle>`"),
                 }
                 Ok(())
             }
@@ -170,8 +171,15 @@ struct AuthResp {
     handle: String,
 }
 
-async fn cmd_register(http: &reqwest::Client, data: &mut VaultData, identity: &Identity, args: &[&str]) -> Result<()> {
-    let handle = args.first().ok_or_else(|| anyhow!("usage: register <handle>"))?;
+async fn cmd_register(
+    http: &reqwest::Client,
+    data: &mut VaultData,
+    identity: &Identity,
+    args: &[&str],
+) -> Result<()> {
+    let handle = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: register <handle>"))?;
     print!("choose a PIN (4-8 digits): ");
     io::stdout().flush()?;
     let pin = rpassword::read_password()?;
@@ -183,13 +191,22 @@ async fn cmd_register(http: &reqwest::Client, data: &mut VaultData, identity: &I
         "pubkey": B64.encode(x_pub),
         "pqPubkey": B64.encode(kem_ek),
     });
-    let resp = http.post(format!("{}/auth/register", backend_base())).json(&body).send().await?;
+    let resp = http
+        .post(format!("{}/auth/register", backend_base()))
+        .json(&body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         let msg: serde_json::Value = resp.json().await.unwrap_or_default();
-        return Err(anyhow!("register failed: {}", msg.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error")));
+        return Err(anyhow!(
+            "register failed: {}",
+            msg.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+        ));
     }
     let auth: AuthResp = resp.json().await?;
-    println!("registered as {} \u2014 you're logged in.", auth.handle);
+    println!("registered as {} — you're logged in.", auth.handle);
     data.token = Some(auth.token);
     data.user_id = Some(auth.user_id);
     data.handle = Some(auth.handle);
@@ -197,15 +214,21 @@ async fn cmd_register(http: &reqwest::Client, data: &mut VaultData, identity: &I
 }
 
 async fn cmd_login(http: &reqwest::Client, data: &mut VaultData, args: &[&str]) -> Result<()> {
-    let handle = args.first().ok_or_else(|| anyhow!("usage: login <handle>"))?;
+    let handle = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: login <handle>"))?;
     print!("PIN: ");
     io::stdout().flush()?;
     let pin = rpassword::read_password()?;
 
     let body = serde_json::json!({ "handle": handle, "pin": pin });
-    let resp = http.post(format!("{}/auth/login", backend_base())).json(&body).send().await?;
+    let resp = http
+        .post(format!("{}/auth/login", backend_base()))
+        .json(&body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("login failed \u2014 check handle/PIN"));
+        return Err(anyhow!("login failed — check handle/PIN"));
     }
     let auth: AuthResp = resp.json().await?;
     println!("logged in as {}.", auth.handle);
@@ -216,11 +239,16 @@ async fn cmd_login(http: &reqwest::Client, data: &mut VaultData, args: &[&str]) 
 }
 
 fn require_token(data: &VaultData) -> Result<&str> {
-    data.token.as_deref().ok_or_else(|| anyhow!("not logged in \u2014 use `register` or `login` first"))
+    data.token
+        .as_deref()
+        .ok_or_else(|| anyhow!("not logged in — use `register` or `login` first"))
 }
 
 async fn cmd_careers(http: &reqwest::Client) -> Result<()> {
-    let resp = http.get(format!("{}/chambers/careers", backend_base())).send().await?;
+    let resp = http
+        .get(format!("{}/chambers/careers", backend_base()))
+        .send()
+        .await?;
     let careers: Vec<String> = resp.json().await?;
     println!("{}", careers.join(", "));
     Ok(())
@@ -238,13 +266,27 @@ struct ChamberRow {
 
 async fn cmd_chambers(http: &reqwest::Client, data: &VaultData) -> Result<()> {
     let token = require_token(data)?;
-    let resp = http.get(format!("{}/chambers", backend_base())).bearer_auth(token).send().await?;
+    let resp = http
+        .get(format!("{}/chambers", backend_base()))
+        .bearer_auth(token)
+        .send()
+        .await?;
     let rows: Vec<ChamberRow> = resp.json().await?;
     if rows.is_empty() {
-        println!("no chambers yet \u2014 try `create-chamber <name>`");
+        println!("no chambers yet — try `create-chamber <name>`");
     }
     for r in rows {
-        println!("{}  {} members  {}  [{}]", r.name, r.member_count, if r.is_member != 0 { "joined" } else { "not joined" }, r.id);
+        println!(
+            "{}  {} members  {}  [{}]",
+            r.name,
+            r.member_count,
+            if r.is_member != 0 {
+                "joined"
+            } else {
+                "not joined"
+            },
+            r.id
+        );
     }
     Ok(())
 }
@@ -263,7 +305,12 @@ async fn cmd_create_chamber(http: &reqwest::Client, data: &VaultData, args: &[&s
         .await?;
     if !resp.status().is_success() {
         let msg: serde_json::Value = resp.json().await.unwrap_or_default();
-        return Err(anyhow!("{}", msg.get("error").and_then(|v| v.as_str()).unwrap_or("could not create chamber")));
+        return Err(anyhow!(
+            "{}",
+            msg.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("could not create chamber")
+        ));
     }
     println!("chamber created.");
     Ok(())
@@ -277,9 +324,16 @@ struct UserBundle {
     pq_pubkey: Option<String>,
 }
 
-async fn cmd_send(http: &reqwest::Client, data: &VaultData, identity: &Identity, args: &[&str]) -> Result<()> {
+async fn cmd_send(
+    http: &reqwest::Client,
+    data: &VaultData,
+    identity: &Identity,
+    args: &[&str],
+) -> Result<()> {
     let token = require_token(data)?;
-    let handle = args.first().ok_or_else(|| anyhow!("usage: send <handle> <message...>"))?;
+    let handle = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: send <handle> <message...>"))?;
     let message = args[1..].join(" ");
     if message.is_empty() {
         return Err(anyhow!("usage: send <handle> <message...>"));
@@ -295,7 +349,7 @@ async fn cmd_send(http: &reqwest::Client, data: &VaultData, identity: &Identity,
     }
     let contact: UserBundle = resp.json().await?;
     let pq_pubkey = contact.pq_pubkey.ok_or_else(|| {
-        anyhow!("{handle} has no ML-KEM public key on file (they registered from the web prototype, which doesn't have a PQ half yet) \u2014 can't do a hybrid seal to them")
+        anyhow!("{handle} has no ML-KEM public key on file (they registered from the web prototype, which doesn't have a PQ half yet) — can't do a hybrid seal to them")
     })?;
 
     let sealed: SealedMessage = veil_crypto::e2e::seal(
@@ -311,7 +365,7 @@ async fn cmd_send(http: &reqwest::Client, data: &VaultData, identity: &Identity,
     // "ciphertext" field alongside the real ciphertext, delimited, so a
     // hybrid-aware recipient (another veil-native client) can split them
     // back apart; a web-prototype recipient without PQ support simply
-    // can't decrypt this message, which is correct \u2014 it never had a PQ
+    // can't decrypt this message, which is correct — it never had a PQ
     // key to negotiate with in the first place.
     let packed = serde_json::json!({
         "kemCt": B64.encode(&sealed.kem_ciphertext),
@@ -327,11 +381,19 @@ async fn cmd_send(http: &reqwest::Client, data: &VaultData, identity: &Identity,
         "nonce": B64.encode(&sealed.nonce),
         "senderPubkey": B64.encode(&sealed.sender_x_public),
     });
-    let resp = http.post(format!("{}/messages", backend_base())).bearer_auth(token).json(&body).send().await?;
+    let resp = http
+        .post(format!("{}/messages", backend_base()))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await?;
     if !resp.status().is_success() {
         return Err(anyhow!("send failed"));
     }
-    println!("sent (hybrid X25519 + ML-KEM-768 sealed, {} bytes ciphertext).", sealed.ciphertext.len());
+    println!(
+        "sent (hybrid X25519 + ML-KEM-768 sealed, {} bytes ciphertext).",
+        sealed.ciphertext.len()
+    );
     Ok(())
 }
 
@@ -349,7 +411,11 @@ struct InboxRow {
 
 async fn cmd_inbox(http: &reqwest::Client, data: &VaultData, identity: &Identity) -> Result<()> {
     let token = require_token(data)?;
-    let resp = http.get(format!("{}/messages", backend_base())).bearer_auth(token).send().await?;
+    let resp = http
+        .get(format!("{}/messages", backend_base()))
+        .bearer_auth(token)
+        .send()
+        .await?;
     let rows: Vec<InboxRow> = resp.json().await?;
     if rows.is_empty() {
         println!("nothing waiting.");
@@ -359,7 +425,10 @@ async fn cmd_inbox(http: &reqwest::Client, data: &VaultData, identity: &Identity
     for row in &rows {
         let packed: serde_json::Value = match serde_json::from_str(&row.ciphertext) {
             Ok(v) => v,
-            Err(_) => { println!("[{}] (not a hybrid-packed message \u2014 skipping, likely from the web prototype's simpler scheme)", row.id); continue; }
+            Err(_) => {
+                println!("[{}] (not a hybrid-packed message — skipping, likely from the web prototype's simpler scheme)", row.id);
+                continue;
+            }
         };
         let kem_ct = B64.decode(packed["kemCt"].as_str().unwrap_or_default())?;
         let ct = B64.decode(packed["ct"].as_str().unwrap_or_default())?;
@@ -371,7 +440,10 @@ async fn cmd_inbox(http: &reqwest::Client, data: &VaultData, identity: &Identity
         };
         match veil_crypto::e2e::open(identity, &sealed) {
             Ok(plaintext) => println!("  {}", String::from_utf8_lossy(&plaintext)),
-            Err(_) => println!("  (could not decrypt {} \u2014 wrong identity for this message)", row.id),
+            Err(_) => println!(
+                "  (could not decrypt {} — wrong identity for this message)",
+                row.id
+            ),
         }
         acked.push(row.id.clone());
     }
@@ -388,13 +460,21 @@ async fn cmd_inbox(http: &reqwest::Client, data: &VaultData, identity: &Identity
 fn cmd_lock_demo() {
     use veil_crypto::lock::Verdict;
     println!("[demo] AppLock: Argon2id passphrase + optional duress passphrase + auto-wipe after N fails.");
-    let mut lock = AppLock::new("correct horse battery staple", Some("i-am-under-duress"), 3).unwrap();
+    let mut lock =
+        AppLock::new("correct horse battery staple", Some("i-am-under-duress"), 3).unwrap();
     println!("  wrong attempt:   {:?}", lock.check("nope", 0));
     println!("  wrong attempt:   {:?}", lock.check("nope", 0));
     match lock.check("i-am-under-duress", 0) {
-        Verdict::Duress => println!("  duress phrase:   Duress \u2014 caller must now call SecureStore::wipe()"),
+        Verdict::Duress => {
+            println!("  duress phrase:   Duress — caller must now call SecureStore::wipe()")
+        }
         other => println!("  duress phrase:   unexpected {other:?}"),
     }
-    println!("  correct phrase:  {:?}", lock.check("correct horse battery staple", 0));
-    println!("  (this demo never touches the real vault \u2014 it's illustrating the state machine only)");
+    println!(
+        "  correct phrase:  {:?}",
+        lock.check("correct horse battery staple", 0)
+    );
+    println!(
+        "  (this demo never touches the real vault — it's illustrating the state machine only)"
+    );
 }

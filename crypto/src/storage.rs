@@ -19,7 +19,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use serde::{de::DeserializeOwned, Serialize};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -52,7 +55,10 @@ impl SecureStore {
         if !path.exists() {
             let salt = random_bytes::<SALT_LEN>();
             let key = derive_key(passphrase, &salt)?;
-            let store = Self { path: path.clone(), key };
+            let store = Self {
+                path: path.clone(),
+                key,
+            };
             store.write_encrypted(&salt, b"{}")?;
             return Ok(store);
         }
@@ -72,7 +78,9 @@ impl SecureStore {
         let nonce = XNonce::from_slice(&rest[..24]);
         let ciphertext = &rest[24..];
         let cipher = XChaCha20Poly1305::new((&self.key).into());
-        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| StorageError::Decrypt)?;
+        let plaintext = cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| StorageError::Decrypt)?;
         let _ = salt; // salt already consumed during open() key derivation
         Ok(serde_json::from_slice(&plaintext)?)
     }
@@ -87,7 +95,9 @@ impl SecureStore {
     fn write_encrypted(&self, salt: &[u8], plaintext: &[u8]) -> Result<(), StorageError> {
         let cipher = XChaCha20Poly1305::new((&self.key).into());
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|_| StorageError::Decrypt)?;
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .map_err(|_| StorageError::Decrypt)?;
         let mut out = Vec::with_capacity(SALT_LEN + 24 + ciphertext.len());
         out.extend_from_slice(salt);
         out.extend_from_slice(&nonce);
@@ -157,7 +167,11 @@ mod tests {
         let path = dir.path().join("vault.bin");
 
         let store = SecureStore::open_or_create(&path, "correct horse battery staple").unwrap();
-        store.save(&Demo { notes: vec!["hello".into()] }).unwrap();
+        store
+            .save(&Demo {
+                notes: vec!["hello".into()],
+            })
+            .unwrap();
         drop(store);
 
         let reopened = SecureStore::open_or_create(&path, "correct horse battery staple").unwrap();

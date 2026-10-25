@@ -34,8 +34,12 @@ pub enum Verdict {
     /// the caller's responsibility so a bug here can't accidentally nuke
     /// data outside of an explicit, deliberate wipe call.
     Duress,
-    WrongPassphrase { attempts_left: u32 },
-    Locked { retry_after_secs: u64 },
+    WrongPassphrase {
+        attempts_left: u32,
+    },
+    Locked {
+        retry_after_secs: u64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -55,7 +59,11 @@ fn default_lock_until() -> u64 {
 impl AppLock {
     /// Create a new lock. `max_fails` defaults to 10 if you pass 0, matching
     /// the "auto-wipe after 10 fails" checklist item.
-    pub fn new(passphrase: &str, duress_passphrase: Option<&str>, max_fails: u32) -> Result<Self, LockError> {
+    pub fn new(
+        passphrase: &str,
+        duress_passphrase: Option<&str>,
+        max_fails: u32,
+    ) -> Result<Self, LockError> {
         let passphrase_hash = hash(passphrase)?;
         let duress_hash = duress_passphrase.map(hash).transpose()?;
         Ok(Self {
@@ -70,7 +78,9 @@ impl AppLock {
     /// Check an attempt. Does not itself touch storage — see `Verdict::Duress`.
     pub fn check(&mut self, attempt: &str, now_unix: u64) -> Verdict {
         if now_unix < self.lock_until_unix {
-            return Verdict::Locked { retry_after_secs: self.lock_until_unix - now_unix };
+            return Verdict::Locked {
+                retry_after_secs: self.lock_until_unix - now_unix,
+            };
         }
         if let Some(duress) = &self.duress_hash {
             if verify(duress, attempt) {
@@ -87,14 +97,18 @@ impl AppLock {
             // Caller must wipe. We still report a locked state afterward in
             // case the caller chooses, deliberately, to keep going without
             // wiping (not recommended, but never our call to force).
-            return Verdict::Locked { retry_after_secs: 0 };
+            return Verdict::Locked {
+                retry_after_secs: 0,
+            };
         }
         // Exponential backoff, same shape as the client-side lockout already
         // shipped in the web prototype.
         let tier = self.fails.saturating_sub(4).max(0);
         let wait = (tier as u64).saturating_mul(tier as u64) * 5;
         self.lock_until_unix = now_unix + wait.min(300);
-        Verdict::WrongPassphrase { attempts_left: self.max_fails.saturating_sub(self.fails) }
+        Verdict::WrongPassphrase {
+            attempts_left: self.max_fails.saturating_sub(self.fails),
+        }
     }
 
     pub fn should_wipe(&self) -> bool {
@@ -120,8 +134,12 @@ fn hash(secret: &str) -> Result<String, LockError> {
 }
 
 fn verify(stored_hash: &str, attempt: &str) -> bool {
-    let Ok(parsed) = PasswordHash::new(stored_hash) else { return false };
-    Argon2::default().verify_password(attempt.as_bytes(), &parsed).is_ok()
+    let Ok(parsed) = PasswordHash::new(stored_hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(attempt.as_bytes(), &parsed)
+        .is_ok()
 }
 
 impl Drop for AppLock {

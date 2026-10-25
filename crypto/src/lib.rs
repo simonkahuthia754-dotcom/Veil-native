@@ -14,10 +14,10 @@
 //! from an established crate. "No custom crypto, ever" is not a slogan here,
 //! it's the actual rule this file follows.
 
+pub mod e2e;
 pub mod lock;
 pub mod storage;
-pub mod e2e;
 
+pub use e2e::{Identity, SealedMessage};
 pub use lock::{AppLock, LockError};
 pub use storage::{SecureStore, StorageError};
-pub use e2e::{Identity, SealedMessage};

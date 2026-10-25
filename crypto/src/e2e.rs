@@ -60,13 +60,21 @@ impl Identity {
         let x_secret = XSecretKey::random_from_rng(OsRng);
         let x_public = XPublicKey::from(&x_secret);
         let (kem_dk, kem_ek) = MlKem768::generate(&mut OsRng);
-        Self { x_secret, x_public, kem_dk, kem_ek }
+        Self {
+            x_secret,
+            x_public,
+            kem_dk,
+            kem_ek,
+        }
     }
 
     /// Public bundle to publish to the server / share with contacts:
     /// (x25519 pubkey bytes, ML-KEM-768 encapsulation key bytes).
     pub fn public_bundle(&self) -> (Vec<u8>, Vec<u8>) {
-        (self.x_public.as_bytes().to_vec(), self.kem_ek.as_bytes().to_vec())
+        (
+            self.x_public.as_bytes().to_vec(),
+            self.kem_ek.as_bytes().to_vec(),
+        )
     }
 }
 
@@ -91,20 +99,24 @@ pub fn seal(
     recipient_kem_ek: &[u8],
     plaintext: &[u8],
 ) -> Result<SealedMessage, E2eError> {
-    let recipient_x: [u8; 32] = recipient_x_public.try_into().map_err(|_| E2eError::BadKey)?;
+    let recipient_x: [u8; 32] = recipient_x_public
+        .try_into()
+        .map_err(|_| E2eError::BadKey)?;
     let recipient_x_public = XPublicKey::from(recipient_x);
     let classical_secret = sender.x_secret.diffie_hellman(&recipient_x_public);
 
     let recipient_ek = <MlKem768 as Kem>::EncapsulationKey::from_bytes(
         recipient_kem_ek.try_into().map_err(|_| E2eError::BadKey)?,
     );
-    let (kem_ciphertext, pq_secret) = MlKem768::encapsulate(&recipient_ek, &mut OsRng)
-        .map_err(|_| E2eError::Encrypt)?;
+    let (kem_ciphertext, pq_secret) =
+        MlKem768::encapsulate(&recipient_ek, &mut OsRng).map_err(|_| E2eError::Encrypt)?;
 
     let key = derive_key(classical_secret.as_bytes(), pq_secret.as_slice());
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
-    let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|_| E2eError::Encrypt)?;
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|_| E2eError::Encrypt)?;
 
     Ok(SealedMessage {
         sender_x_public: sender.x_public.as_bytes().to_vec(),
@@ -116,19 +128,29 @@ pub fn seal(
 
 /// Decrypt a `SealedMessage` addressed to `recipient`.
 pub fn open(recipient: &Identity, msg: &SealedMessage) -> Result<Vec<u8>, E2eError> {
-    let sender_x: [u8; 32] = msg.sender_x_public.as_slice().try_into().map_err(|_| E2eError::BadKey)?;
+    let sender_x: [u8; 32] = msg
+        .sender_x_public
+        .as_slice()
+        .try_into()
+        .map_err(|_| E2eError::BadKey)?;
     let sender_x_public = XPublicKey::from(sender_x);
     let classical_secret = recipient.x_secret.diffie_hellman(&sender_x_public);
 
     let kem_ct = <MlKem768 as Kem>::Ciphertext::from_bytes(
-        msg.kem_ciphertext.as_slice().try_into().map_err(|_| E2eError::BadKey)?,
+        msg.kem_ciphertext
+            .as_slice()
+            .try_into()
+            .map_err(|_| E2eError::BadKey)?,
     );
-    let pq_secret = MlKem768::decapsulate(&recipient.kem_dk, &kem_ct).map_err(|_| E2eError::Decrypt)?;
+    let pq_secret =
+        MlKem768::decapsulate(&recipient.kem_dk, &kem_ct).map_err(|_| E2eError::Decrypt)?;
 
     let key = derive_key(classical_secret.as_bytes(), pq_secret.as_slice());
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XNonce::from_slice(&msg.nonce);
-    cipher.decrypt(nonce, msg.ciphertext.as_slice()).map_err(|_| E2eError::Decrypt)
+    cipher
+        .decrypt(nonce, msg.ciphertext.as_slice())
+        .map_err(|_| E2eError::Decrypt)
 }
 
 fn derive_key(classical: &[u8], pq: &[u8]) -> [u8; 32] {
@@ -137,7 +159,8 @@ fn derive_key(classical: &[u8], pq: &[u8]) -> [u8; 32] {
     ikm.extend_from_slice(pq);
     let hk = Hkdf::<Sha256>::new(Some(b"veil-e2e-hybrid-v1"), &ikm);
     let mut okm = [0u8; 32];
-    hk.expand(b"message-key", &mut okm).expect("32 bytes is a valid HKDF output length");
+    hk.expand(b"message-key", &mut okm)
+        .expect("32 bytes is a valid HKDF output length");
     ikm.zeroize();
     okm
 }
