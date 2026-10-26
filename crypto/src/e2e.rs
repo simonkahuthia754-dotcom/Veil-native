@@ -27,7 +27,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
-use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
+use ml_kem::{
+    kem::{Decapsulate, Encapsulate, Kem},
+    Ciphertext as MlKemCiphertext, KeyExport, MlKem768, TryKeyInit,
+};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -51,15 +54,19 @@ pub enum E2eError {
 pub struct Identity {
     x_secret: XSecretKey,
     pub x_public: XPublicKey,
-    kem_dk: <MlKem768 as KemCore>::DecapsulationKey,
-    pub kem_ek: <MlKem768 as KemCore>::EncapsulationKey,
+    kem_dk: <MlKem768 as Kem>::DecapsulationKey,
+    pub kem_ek: <MlKem768 as Kem>::EncapsulationKey,
 }
 
 impl Identity {
     pub fn generate() -> Self {
         let x_secret = XSecretKey::random_from_rng(OsRng);
         let x_public = XPublicKey::from(&x_secret);
-        let (kem_dk, kem_ek) = MlKem768::generate(&mut OsRng);
+        // Kem::generate_keypair() (not generate()) — confirmed against the
+        // real trait definition in the `kem` crate's own source, which
+        // this module previously wasn't checked against (see Cargo.toml's
+        // note on the 0.2 -> 0.3.3 correction).
+        let (kem_dk, kem_ek) = MlKem768::generate_keypair();
         Self {
             x_secret,
             x_public,
@@ -73,7 +80,9 @@ impl Identity {
     pub fn public_bundle(&self) -> (Vec<u8>, Vec<u8>) {
         (
             self.x_public.as_bytes().to_vec(),
-            self.kem_ek.as_bytes().to_vec(),
+            // KeyExport::to_bytes() -> Array<u8, N>, which derefs to a
+            // plain byte slice.
+            self.kem_ek.to_bytes().to_vec(),
         )
     }
 }
@@ -105,13 +114,17 @@ pub fn seal(
     let recipient_x_public = XPublicKey::from(recipient_x);
     let classical_secret = sender.x_secret.diffie_hellman(&recipient_x_public);
 
-    let recipient_ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(
-        recipient_kem_ek.try_into().map_err(|_| E2eError::BadKey)?,
-    );
-    let (kem_ciphertext, pq_secret) =
-        MlKem768::encapsulate(&recipient_ek, &mut OsRng).map_err(|_| E2eError::Encrypt)?;
+    // TryKeyInit::new_from_slice — the fallible, variable-length-input
+    // constructor (confirmed from the real trait: `fn new_from_slice(key:
+    // &[u8]) -> Result<Self, InvalidKey>`), not an invented `from_bytes`.
+    let recipient_ek = <MlKem768 as Kem>::EncapsulationKey::new_from_slice(recipient_kem_ek)
+        .map_err(|_| E2eError::BadKey)?;
+    // Encapsulate::encapsulate() is infallible (no Result) when the
+    // "getrandom" feature is enabled — confirmed from the real trait
+    // definition, not assumed.
+    let (kem_ciphertext, pq_secret) = recipient_ek.encapsulate();
 
-    let key = derive_key(classical_secret.as_bytes(), pq_secret.as_slice());
+    let key = derive_key(classical_secret.as_bytes(), &pq_secret);
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XChaCha20Poly1305::generate_nonce(&mut AeadOsRng);
     let ciphertext = cipher
@@ -120,7 +133,7 @@ pub fn seal(
 
     Ok(SealedMessage {
         sender_x_public: sender.x_public.as_bytes().to_vec(),
-        kem_ciphertext: kem_ciphertext.as_slice().to_vec(),
+        kem_ciphertext: kem_ciphertext.to_vec(),
         nonce: nonce.to_vec(),
         ciphertext,
     })
@@ -136,16 +149,21 @@ pub fn open(recipient: &Identity, msg: &SealedMessage) -> Result<Vec<u8>, E2eErr
     let sender_x_public = XPublicKey::from(sender_x);
     let classical_secret = recipient.x_secret.diffie_hellman(&sender_x_public);
 
-    let kem_ct = <MlKem768 as KemCore>::Ciphertext::from_bytes(
-        msg.kem_ciphertext
-            .as_slice()
-            .try_into()
-            .map_err(|_| E2eError::BadKey)?,
-    );
-    let pq_secret =
-        MlKem768::decapsulate(&recipient.kem_dk, &kem_ct).map_err(|_| E2eError::Decrypt)?;
+    // Ciphertext<K> is a plain `Array<u8, K::CiphertextSize>` type alias
+    // (confirmed from the `kem` crate's own source), which implements
+    // TryFrom<&[u8]> directly — no `Kem::Ciphertext` associated type or
+    // `from_bytes` constructor exists, unlike this file's first two wrong
+    // guesses.
+    let kem_ct: MlKemCiphertext<MlKem768> = msg
+        .kem_ciphertext
+        .as_slice()
+        .try_into()
+        .map_err(|_| E2eError::BadKey)?;
+    // Decapsulate::decapsulate() is infallible by trait definition
+    // (`-> SharedKey<Self::Kem>`, no Result) — confirmed, not assumed.
+    let pq_secret = recipient.kem_dk.decapsulate(&kem_ct);
 
-    let key = derive_key(classical_secret.as_bytes(), pq_secret.as_slice());
+    let key = derive_key(classical_secret.as_bytes(), &pq_secret);
     let cipher = XChaCha20Poly1305::new((&key).into());
     let nonce = XNonce::from_slice(&msg.nonce);
     cipher

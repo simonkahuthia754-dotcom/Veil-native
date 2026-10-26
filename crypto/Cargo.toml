@@ -15,7 +15,19 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 # classical+PQ hybrid is the real-world recommended transition path (the
 # same approach behind Signal's PQXDH and Chrome's post-quantum TLS), not a
 # PQ-only scheme nobody has had years to attack yet.
-ml-kem = "0.2"
+#
+# Pinned to 0.3.3 deliberately, not 0.2.x: this crate's public API changed
+# materially between those lines (0.2.x exposed a `KemCore` trait; 0.3.x
+# renamed/restructured it to `Kem`/`Encapsulate`/`Decapsulate` re-exported
+# from the separate `kem` crate). 0.2 was the original guess, written
+# without registry access to check it, and it was wrong — confirmed by
+# real CI compiler errors, then corrected here against the actual published
+# source (docs.rs + the `kem`/`ml_kem` crates' own lib.rs), not guessed
+# again. The "getrandom" feature is required for the non-deterministic
+# `generate_keypair()`/`encapsulate()` methods used in e2e.rs — this
+# crate's default features are deliberately empty, so it must be named
+# explicitly.
+ml-kem = { version = "0.3.3", features = ["getrandom"] }
 
 # Combines the two shared secrets into one symmetric key.
 hkdf = "0.12"
