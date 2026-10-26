@@ -103,7 +103,10 @@ impl AppLock {
         }
         // Exponential backoff, same shape as the client-side lockout already
         // shipped in the web prototype.
-        let tier = self.fails.saturating_sub(4).max(0);
+        // `self.fails` is unsigned, so saturating_sub already floors at 0 —
+        // the trailing `.max(0)` clippy flagged was genuinely a no-op, not
+        // a defensive clamp doing anything.
+        let tier = self.fails.saturating_sub(4);
         let wait = (tier as u64).saturating_mul(tier as u64) * 5;
         self.lock_until_unix = now_unix + wait.min(300);
         Verdict::WrongPassphrase {
