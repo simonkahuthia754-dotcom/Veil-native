@@ -1,10 +1,10 @@
 package com.veil.app.crypto
 
-import com.google.crypto.tink.HybridConfig
 import com.google.crypto.tink.HybridDecrypt
 import com.google.crypto.tink.HybridEncrypt
+import com.google.crypto.tink.KeyTemplates
 import com.google.crypto.tink.KeysetHandle
-import com.google.crypto.tink.hybrid.HybridKeyTemplates
+import com.google.crypto.tink.hybrid.HybridConfig
 import java.util.Base64
 
 /**
@@ -72,9 +72,15 @@ class VeilIdentity private constructor(
         /** Generates a fresh identity. Persistence is the caller's job (see SecureStore). */
         fun generate(): VeilIdentity {
             ensureConfigured()
-            val privateHandle = KeysetHandle.generateNew(
-                HybridKeyTemplates.DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_128_GCM,
-            )
+            // Looked up by its registered string name via KeyTemplates.get,
+            // not a typed `HybridKeyTemplates.XXX` constant — confirmed
+            // against Tink's own Tinkey CLI docs and Java how-to (no
+            // predefined-parameters class exists for HPKE the way
+            // PredefinedAeadParameters does for AEAD). This exact name is
+            // what Tinkey's own `--key-template` flag uses for the same
+            // algorithm choice.
+            val template = KeyTemplates.get("DHKEM_X25519_HKDF_SHA256_HKDF_SHA256_AES_128_GCM")
+            val privateHandle = KeysetHandle.generateNew(template)
             val publicHandle = privateHandle.publicKeysetHandle
             return VeilIdentity(publicHandle, privateHandle)
         }
