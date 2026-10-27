@@ -79,5 +79,17 @@ dependencies {
     implementation("com.squareup.retrofit2:converter-gson:2.11.0")
 
     testImplementation("junit:junit:4.13.2")
+    // Plain JVM unit tests (src/test) run against a mocked android.jar
+    // where org.json.JSONObject's methods throw RuntimeException instead
+    // of doing anything — confirmed by real CI output, not assumed: 3 of
+    // 4 E2eTest cases passed (the pure-BouncyCastle crypto ones), and
+    // only `serializeRoundTripPreservesIdentity` failed, exactly the one
+    // that calls VeilIdentity.serializePrivate/fromSerialized, which use
+    // org.json.JSONObject (as does AppLock.kt's toJson/fromJson). Adding
+    // the real org.json implementation here — not androidTestImplementation
+    // — puts actual working JSON classes on the unit-test classpath ahead
+    // of the android.jar stub, the standard fix for this well-known AGP
+    // unit-testing gap (no Robolectric needed for this alone).
+    testImplementation("org.json:json:20250107")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
