@@ -54,7 +54,20 @@ dependencies {
     // non-obvious class here (org.bouncycastle.crypto.{generators,kems,
     // modes,params}.MLKEM*/X25519*/HKDF*/XChaCha20Poly1305/AEADParameters)
     // was checked against the real javadoc before being used.
-    implementation("org.bouncycastle:bcprov-jdk18on:1.78")
+    //
+    // Pinned to 1.86, not the first version this project tried (1.78):
+    // CI proved 1.78 doesn't actually contain the MLKEM*/XChaCha20Poly1305
+    // classes at all ("Unresolved reference" on every one of them) — BC's
+    // ML-KEM (FIPS 203) support landed in a later release than 1.78, and
+    // the javadoc pages this file's design was checked against (served
+    // under a "bcprov-jdk14-javadoc" path that is misleadingly named —
+    // its own page titles read "Bouncy Castle Cryptography Library 1.84/
+    // 1.85") describe that later API, not 1.78's. 1.86 is the version
+    // Maven Central's own artifact page names as current, confirmed
+    // directly from central.sonatype.com rather than guessed — the actual
+    // CI build result below is the real confirmation, same as every other
+    // fix in this project.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.86")
 
     // Argon2id for the app lock — the real reference Argon2 implementation
     // via JNI, not a Java re-implementation of the algorithm.
