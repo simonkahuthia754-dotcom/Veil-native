@@ -154,8 +154,13 @@ class VeilIdentity private constructor(
             val kemGen = MLKEMKeyPairGenerator()
             kemGen.init(MLKEMKeyGenerationParameters(SecureRandom(), MLKEMParameters.ml_kem_768))
             val kemPair: AsymmetricCipherKeyPair = kemGen.generateKeyPair()
-            val kemPrivate = kemPair.private as MLKEMPrivateKeyParameters
-            val kemPublic = kemPair.public as MLKEMPublicKeyParameters
+            // NOT `kemPair.private`/`kemPair.public` — Kotlin's Java-getter
+            // property sugar doesn't apply here because `private` and
+            // `public` are hard keywords in Kotlin, not just identifiers,
+            // so that syntax doesn't parse. Calling the Java getters
+            // explicitly sidesteps the keyword clash entirely.
+            val kemPrivate = kemPair.getPrivate() as MLKEMPrivateKeyParameters
+            val kemPublic = kemPair.getPublic() as MLKEMPublicKeyParameters
 
             return VeilIdentity(xSecret, xPublic, kemPrivate, kemPublic)
         }
