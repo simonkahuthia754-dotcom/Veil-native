@@ -2,12 +2,14 @@ package com.veil.app.state
 
 import android.content.Context
 import com.veil.app.crypto.AppLock
+import com.veil.app.crypto.SealedMessage
 import com.veil.app.crypto.SecureStore
 import com.veil.app.crypto.VeilIdentity
 import com.veil.app.net.ApiClient
 import com.veil.app.net.Chamber
 import com.veil.app.net.CreateChamberRequest
 import com.veil.app.net.SendMessageRequest
+import com.veil.app.net.UserPublicKeys
 import com.veil.app.net.VeilApi
 import org.json.JSONObject
 import retrofit2.Call
@@ -152,6 +154,18 @@ class VeilSession(private val context: Context) {
         })
     }
 
+    /**
+     * Inbox rows carry `ciphertext` as a JSON string of `{"kemCt":...,
+     * "ct":...}` (base64 each) — NOT a bare ciphertext blob. This matches
+     * the CLI's own packing in `cmd_send`/`cmd_inbox` (cli/src/main.rs):
+     * the backend's `/messages` route was built against the web
+     * prototype's simpler crypto_box-only scheme (one ciphertext field,
+     * one nonce field), so a hybrid-aware client packs its extra KEM
+     * ciphertext into the same string field, delimited, rather than
+     * waiting on a backend schema change. A row whose `ciphertext` isn't
+     * valid JSON in that shape is a message from a non-hybrid sender (the
+     * web prototype) and is skipped — same as the CLI does, not an error.
+     */
     fun loadInbox(onSuccess: (List<String>) -> Unit, onError: (String) -> Unit) {
         if (duress) { onSuccess(emptyList()); return }
         val t = token
@@ -166,10 +180,22 @@ class VeilSession(private val context: Context) {
                 val id = identity ?: return
                 val decoded = rows.mapNotNull { row ->
                     try {
-                        val ct = Base64.getDecoder().decode(row.ciphertext)
-                        String(id.open(ct), Charsets.UTF_8)
+                        val packed = JSONObject(row.ciphertext)
+                        val kemCt = Base64.getDecoder().decode(packed.getString("kemCt"))
+                        val ct = Base64.getDecoder().decode(packed.getString("ct"))
+                        val sealed = SealedMessage(
+                            senderXPublic = Base64.getDecoder().decode(row.sender_pubkey),
+                            kemCiphertext = kemCt,
+                            nonce = Base64.getDecoder().decode(row.nonce),
+                            ciphertext = ct,
+                        )
+                        String(id.open(sealed), Charsets.UTF_8)
                     } catch (e: Exception) {
-                        null // not addressed to us, or corrupt — silently skip, never crash the inbox render
+                        // Not a hybrid-packed message (likely the web
+                        // prototype's simpler scheme), not addressed to us,
+                        // or corrupt — silently skip, never crash the inbox
+                        // render on one bad row.
+                        null
                     }
                 }
                 onSuccess(decoded)
@@ -180,26 +206,70 @@ class VeilSession(private val context: Context) {
         })
     }
 
-    fun send(chamberId: String, plaintext: String) {
-        // Scaffold: wires the real HPKE seal() + API call shape, but chamber
-        // fan-out (resolving every member's pubkey and sealing once per
-        // recipient) isn't implemented yet — single-recipient only, same
-        // documented gap as the CLI's `send` command.
-        val id = identity ?: return
-        val a = api ?: return
-        val t = token ?: return
-        val sealed = id.seal(plaintext.toByteArray(Charsets.UTF_8))
-        a.sendMessage(
-            "Bearer $t",
-            SendMessageRequest(
-                recipientHandle = chamberId,
-                ciphertext = Base64.getEncoder().encodeToString(sealed),
-                nonce = "", // HPKE's AEAD nonce is embedded in Tink's ciphertext framing, so this field is unused for this client — left present only to match the shared backend schema
-                senderPubkey = id.publicKeyBase64(),
-            ),
-        ).enqueue(object : Callback<Unit> {
-            override fun onResponse(call: Call<Unit>, response: Response<Unit>) {}
-            override fun onFailure(call: Call<Unit>, t: Throwable) {}
+    /**
+     * Resolves `recipientHandle`'s public bundle, then seals and sends.
+     * Chamber fan-out (resolving every member's pubkey and sealing once
+     * per recipient) isn't implemented yet — single-recipient only, same
+     * documented gap as the CLI's `send` command — so `recipientHandle`
+     * must be a user handle, not yet a real chamber ID with multiple
+     * members.
+     *
+     * Known gap this surfaces rather than hides: nothing in this client
+     * currently calls `VeilApi.register()`, so a fresh identity's
+     * X25519/ML-KEM-768 public keys are never actually published to the
+     * backend — `getUserKeys()` below will 404/come back without a
+     * `pqPubkey` for any user who hasn't registered through some other
+     * path (e.g. the CLI). Wiring registration into the lock-creation flow
+     * is a separate, still-open task, not silently assumed done here.
+     */
+    fun send(recipientHandle: String, plaintext: String, onError: (String) -> Unit = {}) {
+        val id = identity ?: return onError("Not unlocked.")
+        val a = api ?: return onError("Not connected.")
+        val t = token ?: return onError("Not authenticated.")
+
+        a.getUserKeys("Bearer $t", recipientHandle).enqueue(object : Callback<UserPublicKeys> {
+            override fun onResponse(call: Call<UserPublicKeys>, response: Response<UserPublicKeys>) {
+                val contact = response.body()
+                val xPub = contact?.pubkey
+                val pqPub = contact?.pqPubkey
+                if (!response.isSuccessful || contact == null || xPub == null) {
+                    onError("No such user: $recipientHandle")
+                    return
+                }
+                if (pqPub == null) {
+                    onError(
+                        "$recipientHandle has no ML-KEM public key on file (registered from " +
+                            "a non-hybrid client) — can't do a hybrid seal to them.",
+                    )
+                    return
+                }
+
+                val sealed = id.seal(plaintext.toByteArray(Charsets.UTF_8), xPub, pqPub)
+                val packed = JSONObject().apply {
+                    put("kemCt", Base64.getEncoder().encodeToString(sealed.kemCiphertext))
+                    put("ct", Base64.getEncoder().encodeToString(sealed.ciphertext))
+                }.toString()
+
+                a.sendMessage(
+                    "Bearer $t",
+                    SendMessageRequest(
+                        recipientHandle = recipientHandle,
+                        ciphertext = packed,
+                        nonce = Base64.getEncoder().encodeToString(sealed.nonce),
+                        senderPubkey = Base64.getEncoder().encodeToString(sealed.senderXPublic),
+                    ),
+                ).enqueue(object : Callback<Unit> {
+                    override fun onResponse(call: Call<Unit>, response: Response<Unit>) {
+                        if (!response.isSuccessful) onError("Send failed: ${response.code()}")
+                    }
+                    override fun onFailure(call: Call<Unit>, t: Throwable) {
+                        onError(t.message ?: "Network error")
+                    }
+                })
+            }
+            override fun onFailure(call: Call<UserPublicKeys>, t: Throwable) {
+                onError(t.message ?: "Network error")
+            }
         })
     }
 }

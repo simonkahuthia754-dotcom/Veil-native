@@ -45,11 +45,16 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("androidx.navigation:navigation-compose:2.7.7")
 
-    // Real, audited crypto — not a hand-rolled scheme. Google's Tink
-    // provides standardized HPKE (RFC 9180, X25519-based) for E2E, used the
-    // same way the web prototype and CLI use their own public-key schemes:
-    // client-side only, server never has a decryption key.
-    implementation("com.google.crypto.tink:tink-android:1.14.1")
+    // BouncyCastle: hybrid X25519 + ML-KEM-768 E2E encryption, built to be
+    // byte-for-byte wire-compatible with the Rust CLI's crypto/src/e2e.rs
+    // (HKDF-SHA256 + XChaCha20-Poly1305 on top of the same two key
+    // agreements). This REPLACED Tink's HPKE, which was classical-only and
+    // produced an incompatible ciphertext format — an Android user and a
+    // CLI user could not read each other's messages under it. Every
+    // non-obvious class here (org.bouncycastle.crypto.{generators,kems,
+    // modes,params}.MLKEM*/X25519*/HKDF*/XChaCha20Poly1305/AEADParameters)
+    // was checked against the real javadoc before being used.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78")
 
     // Argon2id for the app lock — the real reference Argon2 implementation
     // via JNI, not a Java re-implementation of the algorithm.
