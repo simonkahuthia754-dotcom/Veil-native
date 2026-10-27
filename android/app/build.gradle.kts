@@ -53,7 +53,7 @@ dependencies {
 
     // Argon2id for the app lock — the real reference Argon2 implementation
     // via JNI, not a Java re-implementation of the algorithm.
-    implementation("com.lambdapioneer.argon2kt:argon2kt:1.5.0")
+    implementation("com.lambdapioneer.argon2kt:argon2kt:1.6.0")
 
     // Networking: the same backend the CLI and web prototype talk to.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

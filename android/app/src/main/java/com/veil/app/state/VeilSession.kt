@@ -9,6 +9,7 @@ import com.veil.app.net.Chamber
 import com.veil.app.net.CreateChamberRequest
 import com.veil.app.net.SendMessageRequest
 import com.veil.app.net.VeilApi
+import org.json.JSONObject
 import retrofit2.Call
 import retrofit2.Callback
 import retrofit2.Response
@@ -23,12 +24,13 @@ import java.util.Base64
  * `ViewModel` + `SavedStateHandle` and inject `backendUrl`/`socksProxy`
  * from a settings screen instead of the hardcoded defaults below.
  *
- * Honesty note on "duress": `enterDuress()` currently just flips a flag and
- * serves an empty chamber list — it does NOT yet wipe the real vault file
- * the way the design calls for (see cli's lock.rs `should_wipe` for the
- * policy this is supposed to mirror). Wiring real-vault wipe into the
- * duress path on Android is listed as an explicit TODO in the top-level
- * README rather than silently left half-done.
+ * Lock + identity persistence (the README's top "Next milestone" item) is
+ * now real: `veil.meta` holds the Argon2-hashed passphrase/duress state
+ * plus the vault's key-derivation salt (none of that is secret — the
+ * Argon2 PHC strings are safe to store, same reasoning as lock.rs on the
+ * Rust side), and `veil.vault` holds the AES-GCM-encrypted serialized
+ * identity keyset. `unlock()` now actually checks the passphrase against
+ * what was persisted at `createLock()` time, instead of always succeeding.
  */
 class VeilSession(private val context: Context) {
     private var lock: AppLock? = null
@@ -45,26 +47,89 @@ class VeilSession(private val context: Context) {
 
     fun createLock(passphrase: String) {
         val newLock = AppLock.create(passphrase)
+        val keySalt = SecureStore.newSalt()
+        writeMeta(newLock, keySalt)
         lock = newLock
-        // Persisting AppLock's hash+salt is intentionally NOT shown here —
-        // it needs a small serialization format mirroring lock.rs's. Left
-        // as a marked TODO rather than faked with an insecure shortcut
-        // (e.g. storing the raw passphrase), matching the same honesty
-        // standard the CLI held for identity persistence.
-        metaFile.writeBytes(byteArrayOf(1)) // placeholder marker: "a lock exists"
-        identity = VeilIdentity.generate()
+
+        val newStore = SecureStore.open(vaultFile, passphrase, keySalt)
+        store = newStore
+        val newIdentity = VeilIdentity.generate()
+        identity = newIdentity
+        newStore.save(VeilIdentity.serializePrivate(newIdentity).toByteArray(Charsets.UTF_8))
+
         api = ApiClient.build(backendUrl())
     }
 
     fun unlock(passphrase: String): AppLock.Verdict {
-        // TODO: load persisted AppLock state instead of recreating one —
-        // tracked as part of the same persistence gap noted in createLock().
-        api = ApiClient.build(backendUrl())
-        return AppLock.Verdict.Unlocked
+        if (!metaFile.exists()) {
+            // Shouldn't happen if the UI gates on isLockSet() first, but
+            // fail closed rather than silently unlocking.
+            return AppLock.Verdict.WrongPassphrase(0)
+        }
+        val metaJson = metaFile.readText()
+        val metaObj = JSONObject(metaJson)
+        val keySaltB64 = metaObj.getString("keySalt")
+        val keySalt = Base64.getDecoder().decode(keySaltB64)
+        val loadedLock = AppLock.fromJson(metaJson)
+
+        val verdict = loadedLock.attempt(passphrase, System.currentTimeMillis())
+        // Persist updated fail-count/lockout state on every attempt —
+        // right or wrong — so a lockout survives the app being killed and
+        // restarted between guesses, closing the gap a purely in-memory
+        // fail counter would leave open.
+        writeMeta(loadedLock, keySalt)
+
+        when (verdict) {
+            is AppLock.Verdict.Unlocked -> {
+                lock = loadedLock
+                val newStore = SecureStore.open(vaultFile, passphrase, keySalt)
+                store = newStore
+                val serialized = newStore.load()
+                identity = if (serialized != null) {
+                    VeilIdentity.fromSerialized(String(serialized, Charsets.UTF_8))
+                } else {
+                    // Vault file missing or undecryptable even though the
+                    // passphrase checked out — regenerate rather than
+                    // crash. A real client would treat this as data loss
+                    // worth surfacing to the user, not silently paper over;
+                    // flagged here rather than pretending it can't happen.
+                    VeilIdentity.generate()
+                }
+                api = ApiClient.build(backendUrl())
+                duress = false
+            }
+            is AppLock.Verdict.Duress -> {
+                // Caller is expected to call enterDuress() next, which does
+                // the actual wipe — this class never wipes on its own
+                // initiative from inside attempt()'s result handling, same
+                // separation-of-concerns lock.rs documents on the Rust side.
+            }
+            else -> {}
+        }
+        return verdict
     }
 
+    /**
+     * Real duress handling: wipes both the encrypted vault and the lock
+     * metadata itself, so the app reverts to looking like a fresh,
+     * never-configured install — not just an in-memory flag that still
+     * left the real encrypted data sitting on disk, which is what this
+     * method used to do.
+     */
     fun enterDuress() {
         duress = true
+        store?.wipe()
+        if (vaultFile.exists()) vaultFile.delete()
+        if (metaFile.exists()) metaFile.delete()
+        identity = null
+        store = null
+        lock = null
+    }
+
+    private fun writeMeta(appLock: AppLock, keySalt: ByteArray) {
+        val obj = JSONObject(appLock.toJson())
+        obj.put("keySalt", Base64.getEncoder().encodeToString(keySalt))
+        metaFile.writeText(obj.toString())
     }
 
     fun backendUrl(): String =

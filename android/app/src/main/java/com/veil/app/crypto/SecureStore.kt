@@ -22,6 +22,13 @@ import javax.crypto.spec.SecretKeySpec
  * `wipe()` overwrites then deletes; on flash storage with wear-leveling
  * this is best-effort, not a forensic guarantee — the same honest caveat
  * storage.rs carries, not a weaker one.
+ *
+ * Key derivation corrected against Argon2Kt's real, confirmed API (same
+ * pass as AppLock.kt): the original call used `.rawHashAsByteArray()` and
+ * a `parallelism` argument that were never confirmed to exist against the
+ * real library. The confirmed output method is `rawHashAsHexadecimal()`
+ * instead — this derives the AES key from it via a plain hex decode,
+ * which needs nothing more from the library than what's already verified.
  */
 class SecureStore private constructor(
     private val file: File,
@@ -59,15 +66,26 @@ class SecureStore private constructor(
     companion object {
         private val argon2 = Argon2Kt()
 
+        fun newSalt(): ByteArray = ByteArray(16).also { SecureRandom().nextBytes(it) }
+
         /** Derives the file key from the already-unlocked passphrase. Call only after AppLock.attempt() == Unlocked. */
         fun open(vaultFile: File, passphrase: String, keySalt: ByteArray): SecureStore {
-            val key = argon2.hash(
-                Argon2Mode.ARGON2_ID,
-                passphrase.toByteArray(Charsets.UTF_8),
-                keySalt,
-                3, 65536, 4,
-            ).rawHashAsByteArray().copyOf(32) // AES-256 key
+            val hex = argon2.hash(
+                mode = Argon2Mode.ARGON2_ID,
+                password = passphrase.toByteArray(Charsets.UTF_8),
+                salt = keySalt,
+                tCostInIterations = 3,
+                mCostInKibibyte = 65536,
+            ).rawHashAsHexadecimal()
+            val key = hexToBytes(hex).copyOf(32) // AES-256 key
             return SecureStore(vaultFile, key)
+        }
+
+        private fun hexToBytes(hex: String): ByteArray {
+            val clean = if (hex.length % 2 == 1) "0$hex" else hex
+            return ByteArray(clean.length / 2) { i ->
+                clean.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            }
         }
     }
 }
