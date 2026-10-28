@@ -86,16 +86,23 @@ impl Identity {
         )
     }
 
-    /// Crate-internal access to the private halves, for `session.rs`'s
-    /// X3DH-style handshake, which needs to run its own DH/decapsulation
-    /// operations against this identity's long-term secret keys alongside
-    /// a medium-term/one-time prekey's. Not `pub`: nothing outside this
-    /// crate should ever touch these directly.
+    /// Crate-internal access to the classical secret half, for
+    /// `session.rs`'s X3DH-style handshake, which runs its own DH
+    /// operations against this identity's long-term X25519 key alongside a
+    /// medium-term/one-time prekey's. Not `pub`: nothing outside this
+    /// crate should ever touch this directly.
+    ///
+    /// No equivalent `kem_dk()` accessor: the X3DH handshake's KEM
+    /// encapsulation step is always run against the responder's
+    /// medium-term prekey (so a rotated-out medium-term prekey changes the
+    /// PQ contribution for new sessions too — see session.rs's module
+    /// doc), never against the long-term identity's own PQ key, so nothing
+    /// in this crate needs to reach `kem_dk` from outside `e2e.rs`. A
+    /// first version of this accessor existed unused and was removed —
+    /// caught by clippy's dead-code lint in CI, not left in as an
+    /// `#[allow(dead_code)]`.
     pub(crate) fn x_secret(&self) -> &XSecretKey {
         &self.x_secret
-    }
-    pub(crate) fn kem_dk(&self) -> &<MlKem768 as Kem>::DecapsulationKey {
-        &self.kem_dk
     }
 }
 
