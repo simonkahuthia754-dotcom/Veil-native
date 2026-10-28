@@ -25,8 +25,15 @@ async function register(base, handle, pin, pubkey = "x-" + handle, pqPubkey = "p
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ handle, pin, pubkey, pqPubkey }),
   });
-  assert.equal(res.status, 201, await res.text());
-  return res.json();
+  // Read the body exactly once — a fetch Response body stream can only be
+  // consumed once; calling res.text() for a failure message and then
+  // res.json() to return the parsed body (the original, broken version of
+  // this helper) throws "Body is unusable: Body has already been read" on
+  // EVERY call, success or not, since both branches of `assert.equal`'s
+  // arguments are evaluated regardless of whether the assertion passes.
+  const body = await res.json();
+  assert.equal(res.status, 201, JSON.stringify(body));
+  return body;
 }
 
 test("register then fetch own public keys via another user's session", async (t) => {
