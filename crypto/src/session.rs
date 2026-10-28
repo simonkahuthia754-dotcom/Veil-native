@@ -94,7 +94,10 @@ impl Prekey {
     }
 
     pub fn public_bundle(&self) -> (Vec<u8>, Vec<u8>) {
-        (self.x_public.as_bytes().to_vec(), self.kem_ek.to_bytes().to_vec())
+        (
+            self.x_public.as_bytes().to_vec(),
+            self.kem_ek.to_bytes().to_vec(),
+        )
     }
 }
 
@@ -233,7 +236,9 @@ pub fn initiate(
     let ephemeral_secret = XSecretKey::random_from_rng(OsRng);
     let ephemeral_public = XPublicKey::from(&ephemeral_secret);
 
-    let dh1 = my_identity.x_secret().diffie_hellman(&responder_medium_term_x);
+    let dh1 = my_identity
+        .x_secret()
+        .diffie_hellman(&responder_medium_term_x);
     let dh2 = ephemeral_secret.diffie_hellman(&responder_identity_x);
     let dh3 = ephemeral_secret.diffie_hellman(&responder_medium_term_x);
     let dh4 = match &bundle.one_time_x_public {
@@ -284,9 +289,15 @@ pub fn accept(
     let initiator_identity_x = parse_x_public(&init_msg.initiator_identity_x_public)?;
     let initiator_ephemeral_x = parse_x_public(&init_msg.initiator_ephemeral_x_public)?;
 
-    let dh1 = my_medium_term.x_secret.diffie_hellman(&initiator_identity_x);
-    let dh2 = my_identity.x_secret().diffie_hellman(&initiator_ephemeral_x);
-    let dh3 = my_medium_term.x_secret.diffie_hellman(&initiator_ephemeral_x);
+    let dh1 = my_medium_term
+        .x_secret
+        .diffie_hellman(&initiator_identity_x);
+    let dh2 = my_identity
+        .x_secret()
+        .diffie_hellman(&initiator_ephemeral_x);
+    let dh3 = my_medium_term
+        .x_secret
+        .diffie_hellman(&initiator_ephemeral_x);
     let dh4 = match &init_msg.one_time_x_public_used {
         Some(otpk_pub) => {
             let otpk = my_one_time_prekeys
@@ -385,7 +396,11 @@ impl Session {
 mod tests {
     use super::*;
 
-    fn bundle_from(identity: &Identity, medium_term: &Prekey, otpk: Option<&Prekey>) -> PrekeyBundle {
+    fn bundle_from(
+        identity: &Identity,
+        medium_term: &Prekey,
+        otpk: Option<&Prekey>,
+    ) -> PrekeyBundle {
         let (mt_x, mt_kem) = medium_term.public_bundle();
         PrekeyBundle {
             identity_x_public: identity.x_public.as_bytes().to_vec(),
@@ -405,7 +420,11 @@ mod tests {
         let mut bob_otpk_store = HashMap::new();
         bob_otpk_store.insert(bob_otpk_pub, bob_otpk);
 
-        let bundle = bundle_from(&bob, &bob_mtpk, Some(bob_otpk_store.values().next().unwrap()));
+        let bundle = bundle_from(
+            &bob,
+            &bob_mtpk,
+            Some(bob_otpk_store.values().next().unwrap()),
+        );
         let (mut alice_session, init_msg) = initiate(&alice, &bundle).unwrap();
         let mut bob_session = accept(&bob, &bob_mtpk, &mut bob_otpk_store, &init_msg).unwrap();
 
@@ -429,7 +448,10 @@ mod tests {
         let mut bob_session = accept(&bob, &bob_mtpk, &mut empty_store, &init_msg).unwrap();
 
         let sealed = alice_session.seal(b"no one-time prekey this time").unwrap();
-        assert_eq!(bob_session.open(&sealed).unwrap(), b"no one-time prekey this time");
+        assert_eq!(
+            bob_session.open(&sealed).unwrap(),
+            b"no one-time prekey this time"
+        );
     }
 
     #[test]
