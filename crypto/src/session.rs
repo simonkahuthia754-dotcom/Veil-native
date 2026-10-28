@@ -44,7 +44,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use ml_kem::{
     kem::{Decapsulate, Encapsulate, Kem},
-    Ciphertext as MlKemCiphertext, KeyExport, MlKem768, TryKeyInit,
+    Ciphertext as MlKemCiphertext, KeyExport, KeyInit, MlKem768, TryKeyInit,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -98,6 +98,39 @@ impl Prekey {
             self.x_public.as_bytes().to_vec(),
             self.kem_ek.to_bytes().to_vec(),
         )
+    }
+
+    /// Export/reconstruct secret material, same shape and same reasoning as
+    /// `Identity::to_secret_bytes`/`from_secret_bytes` in `e2e.rs`: a
+    /// client needs to persist a medium-term prekey (and every
+    /// not-yet-consumed one-time prekey) across restarts, since losing the
+    /// private half of a prekey a contact already fetched the public half
+    /// of means that contact can no longer complete a handshake against it.
+    pub fn to_secret_bytes(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            self.x_secret.to_bytes().to_vec(),
+            self.kem_dk.to_bytes().to_vec(),
+        )
+    }
+
+    pub fn from_secret_bytes(
+        x_secret_bytes: &[u8],
+        kem_seed_bytes: &[u8],
+    ) -> Result<Self, SessionError> {
+        let x_arr: [u8; 32] = x_secret_bytes
+            .try_into()
+            .map_err(|_| SessionError::BadKey)?;
+        let x_secret = XSecretKey::from(x_arr);
+        let x_public = XPublicKey::from(&x_secret);
+        let kem_dk = <MlKem768 as Kem>::DecapsulationKey::new_from_slice(kem_seed_bytes)
+            .map_err(|_| SessionError::BadKey)?;
+        let kem_ek = kem_dk.encapsulation_key().clone();
+        Ok(Self {
+            x_secret,
+            x_public,
+            kem_dk,
+            kem_ek,
+        })
     }
 }
 
@@ -160,7 +193,17 @@ const MAX_SKIP: u32 = 1000;
 // new code in this session rather than a pattern already proven by CI
 // elsewhere in this crate) adds a real `Drop` impl that zeroizes the
 // non-skipped fields when a `Session` goes out of scope.
-#[derive(Zeroize, ZeroizeOnDrop)]
+//
+// Also `Serialize`/`Deserialize`: a client needs to persist live session
+// state (the chain keys, counters, and any cached skipped-position keys)
+// across restarts — without that, every restart would silently lose
+// forward-secrecy state and force a brand-new handshake per contact. This
+// is the same "secret state goes in the encrypted-at-rest vault, never
+// written out any other way" rule the rest of this codebase already
+// follows for `Identity` and `Prekey`; persisting a `Session` doesn't
+// weaken the forward-secrecy property, since the vault itself is the thing
+// protecting all of this device's secrets at rest.
+#[derive(Zeroize, ZeroizeOnDrop, Serialize, Deserialize)]
 pub struct Session {
     send_chain_key: [u8; 32],
     #[zeroize(skip)]
@@ -549,5 +592,37 @@ mod tests {
         let mut far_future = alice_session.seal(b"way ahead").unwrap();
         far_future.counter = MAX_SKIP + 1;
         assert!(bob_session.open(&far_future).is_err());
+    }
+
+    #[test]
+    fn prekey_secret_bytes_round_trip() {
+        let original = Prekey::generate();
+        let (x_bytes, kem_bytes) = original.to_secret_bytes();
+        let restored = Prekey::from_secret_bytes(&x_bytes, &kem_bytes).unwrap();
+        assert_eq!(original.public_bundle(), restored.public_bundle());
+    }
+
+    #[test]
+    fn session_survives_a_serde_round_trip_mid_conversation() {
+        // Proves a `Session` can be persisted to and restored from a
+        // client's vault without losing sync with the other side — the
+        // real-world shape of this is: send a message, restart the app
+        // (reload the session from disk), then keep talking.
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let bob_mtpk = Prekey::generate();
+        let mut empty_store = HashMap::new();
+        let bundle = bundle_from(&bob, &bob_mtpk, None);
+        let (mut alice_session, init_msg) = initiate(&alice, &bundle).unwrap();
+        let mut bob_session = accept(&bob, &bob_mtpk, &mut empty_store, &init_msg).unwrap();
+
+        let m0 = alice_session.seal(b"before restart").unwrap();
+        assert_eq!(bob_session.open(&m0).unwrap(), b"before restart");
+
+        let json = serde_json::to_vec(&alice_session).unwrap();
+        let mut alice_session: Session = serde_json::from_slice(&json).unwrap();
+
+        let m1 = alice_session.seal(b"after restart").unwrap();
+        assert_eq!(bob_session.open(&m1).unwrap(), b"after restart");
     }
 }

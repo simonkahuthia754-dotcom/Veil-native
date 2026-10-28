@@ -29,7 +29,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use ml_kem::{
     kem::{Decapsulate, Encapsulate, Kem},
-    Ciphertext as MlKemCiphertext, KeyExport, MlKem768, TryKeyInit,
+    Ciphertext as MlKemCiphertext, KeyExport, KeyInit, MlKem768, TryKeyInit,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,60 @@ impl Identity {
     /// `#[allow(dead_code)]`.
     pub(crate) fn x_secret(&self) -> &XSecretKey {
         &self.x_secret
+    }
+
+    /// Export the secret material needed to reconstruct this identity
+    /// later, e.g. to persist it in a client's encrypted-at-rest vault so
+    /// the same identity survives across restarts instead of being
+    /// regenerated every run (which would break every contact's existing
+    /// sessions with this device).
+    ///
+    /// Returns `(x25519 secret bytes, ML-KEM-768 seed bytes)`:
+    ///   - `StaticSecret::to_bytes(&self) -> [u8; 32]` — confirmed against
+    ///     the real x25519-dalek 2.x source (not assumed from the existing
+    ///     `as_bytes()` usage elsewhere in this file, which returns a
+    ///     reference, not an owned copy).
+    ///   - `KeyExport::to_bytes(&self) -> Seed` on `DecapsulationKey` — a
+    ///     64-byte seed, NOT the same byte shape as the encapsulation
+    ///     key's export. Confirmed via the `ml-kem` crate's own docs: this
+    ///     panics only for a key built from "expanded form", which never
+    ///     applies here since every `Identity` is built by
+    ///     `generate_keypair()` or by this same round-trip.
+    pub fn to_secret_bytes(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            self.x_secret.to_bytes().to_vec(),
+            self.kem_dk.to_bytes().to_vec(),
+        )
+    }
+
+    /// Reconstruct an `Identity` from bytes previously produced by
+    /// `to_secret_bytes()`. Both halves are re-derived deterministically
+    /// from their secrets (the X25519 public key from the secret scalar,
+    /// the ML-KEM encapsulation key from the decapsulation key), so the
+    /// result is byte-for-byte the same identity that was exported.
+    pub fn from_secret_bytes(
+        x_secret_bytes: &[u8],
+        kem_seed_bytes: &[u8],
+    ) -> Result<Self, E2eError> {
+        let x_arr: [u8; 32] = x_secret_bytes.try_into().map_err(|_| E2eError::BadKey)?;
+        let x_secret = XSecretKey::from(x_arr);
+        let x_public = XPublicKey::from(&x_secret);
+
+        // KeyInit::new_from_slice(key: &[u8]) -> Result<Self, InvalidLength>
+        // — a different trait and error type than EncapsulationKey's
+        // TryKeyInit::new_from_slice (-> Result<Self, InvalidKey>) used
+        // elsewhere in this file. Confirmed as a real asymmetry in the
+        // `ml-kem` crate's own docs, not assumed to match.
+        let kem_dk = <MlKem768 as Kem>::DecapsulationKey::new_from_slice(kem_seed_bytes)
+            .map_err(|_| E2eError::BadKey)?;
+        let kem_ek = kem_dk.encapsulation_key().clone();
+
+        Ok(Self {
+            x_secret,
+            x_public,
+            kem_dk,
+            kem_ek,
+        })
     }
 }
 
@@ -215,6 +269,27 @@ mod tests {
         let sealed = seal(&alice, &bob_x, &bob_kem, b"the chamber meets at dusk").unwrap();
         let opened = open(&bob, &sealed).unwrap();
         assert_eq!(opened, b"the chamber meets at dusk");
+    }
+
+    #[test]
+    fn secret_bytes_round_trip_preserves_identity() {
+        let original = Identity::generate();
+        let (x_bytes, kem_bytes) = original.to_secret_bytes();
+        let restored = Identity::from_secret_bytes(&x_bytes, &kem_bytes).unwrap();
+
+        assert_eq!(original.x_public.as_bytes(), restored.x_public.as_bytes());
+        assert_eq!(original.public_bundle(), restored.public_bundle());
+
+        // And the restored identity must actually work for real messages,
+        // not just report matching public keys.
+        let other = Identity::generate();
+        let (other_x, other_kem) = other.public_bundle();
+        let sealed = seal(&restored, &other_x, &other_kem, b"still me").unwrap();
+        assert_eq!(open(&other, &sealed).unwrap(), b"still me");
+
+        let (restored_x, restored_kem) = restored.public_bundle();
+        let sealed_to_restored = seal(&other, &restored_x, &restored_kem, b"to you").unwrap();
+        assert_eq!(open(&restored, &sealed_to_restored).unwrap(), b"to you");
     }
 
     #[test]

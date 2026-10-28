@@ -11,8 +11,12 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, Write};
-use veil_crypto::{AppLock, Identity, SealedMessage, SecureStore};
+use veil_crypto::{
+    accept_session, initiate_session, AppLock, Identity, PrekeyBundle, SealedMessage, SecureStore,
+    Session,
+};
 
 #[derive(Serialize, Deserialize, Default)]
 struct VaultData {
@@ -21,6 +25,28 @@ struct VaultData {
     handle: Option<String>,
     x_secret_b64: Option<String>, // stored so Identity survives restarts (see note in main())
     kem_dk_b64: Option<String>,
+
+    // Forward-secrecy state (session.rs). This device's own medium-term
+    // prekey secret — published once (publicly) and kept until rotated;
+    // losing this means every contact who already fetched its public half
+    // can no longer complete a handshake against it.
+    medium_term_x_b64: Option<String>,
+    medium_term_kem_b64: Option<String>,
+    // One-time prekeys this device has published and not yet had consumed
+    // by an incoming handshake, keyed by their public X25519 bytes
+    // (base64, matching what the server hands back in an InitialMessage's
+    // `one_time_x_public_used`) -> (x secret b64, kem seed b64). Each
+    // entry is removed the moment it's used to accept a handshake — a
+    // one-time prekey that stays reusable isn't one.
+    #[serde(default)]
+    one_time_prekeys: HashMap<String, (String, String)>,
+    // Live per-contact session state, keyed by the contact's long-term
+    // X25519 identity public key (base64) — not by handle, since a handle
+    // is only known to the side that initiated the conversation; the
+    // identity key is known to both sides from the first message either
+    // way.
+    #[serde(default)]
+    sessions: HashMap<String, Session>,
 }
 
 fn data_dir() -> Result<std::path::PathBuf> {
@@ -73,19 +99,39 @@ async fn main() -> Result<()> {
     // on.
 
     let identity = match (&data.x_secret_b64, &data.kem_dk_b64) {
-        (Some(_), Some(_)) => {
-            // NOTE: veil-crypto's Identity intentionally does not expose a
-            // from_bytes constructor yet (keeping secret material inside
-            // the type, generated once, is the safer default). Wiring
-            // persistence through needs a small, deliberate addition to
-            // veil-crypto (a `Identity::from_secret_bytes` constructor) —
-            // flagged here rather than worked around with an unsafe cast.
-            println!("[veil] NOTE: identity persistence needs Identity::from_secret_bytes in veil-crypto (TODO, see README) — generating a fresh identity for this session instead of reusing the stored one.");
-            Identity::generate()
+        (Some(x_b64), Some(kem_b64)) => {
+            let x_bytes = B64
+                .decode(x_b64)
+                .context("corrupted vault: stored X25519 secret isn't valid base64")?;
+            let kem_bytes = B64
+                .decode(kem_b64)
+                .context("corrupted vault: stored ML-KEM seed isn't valid base64")?;
+            match Identity::from_secret_bytes(&x_bytes, &kem_bytes) {
+                Ok(id) => {
+                    println!("[veil] restored existing identity from the vault.");
+                    id
+                }
+                Err(e) => {
+                    // A corrupted/truncated stored identity is a real
+                    // failure, not silently papered over with a fresh
+                    // identity (that would quietly break every contact's
+                    // sessions with this device without saying so).
+                    return Err(anyhow!(
+                        "stored identity in the vault is unreadable ({e}) — the vault file may be corrupted. Refusing to silently replace it; restore from a backup or delete the vault to start over."
+                    ));
+                }
+            }
         }
         _ => {
             println!("[veil] generating a new hybrid identity (X25519 + ML-KEM-768)…");
-            Identity::generate()
+            let identity = Identity::generate();
+            let (x_bytes, kem_bytes) = identity.to_secret_bytes();
+            data.x_secret_b64 = Some(B64.encode(x_bytes));
+            data.kem_dk_b64 = Some(B64.encode(kem_bytes));
+            store
+                .save(&data)
+                .context("failed to persist the new identity to the vault")?;
+            identity
         }
     };
 
@@ -122,8 +168,8 @@ async fn main() -> Result<()> {
             "careers" => cmd_careers(&http).await,
             "chambers" => cmd_chambers(&http, &data).await,
             "create-chamber" => cmd_create_chamber(&http, &data, &rest).await,
-            "send" => cmd_send(&http, &data, &identity, &rest).await,
-            "inbox" => cmd_inbox(&http, &data, &identity).await,
+            "send" => cmd_send(&http, &mut data, &identity, &rest).await,
+            "inbox" => cmd_inbox(&http, &mut data, &identity).await,
             "lock" => {
                 cmd_lock_demo();
                 Ok(())
@@ -165,8 +211,11 @@ Environment:
 
 #[derive(Deserialize)]
 struct AuthResp {
-    #[serde(rename = "userId")]
-    user_id: String,
+    // The backend's authResponse() (backend/src/app.js) returns the field
+    // as plain "id", matching Android's AuthResponse.id — this used to say
+    // "userId" here, a guessed field name written before the real backend
+    // existed. Fixed now that there's a real contract to check against.
+    id: String,
     token: String,
     handle: String,
 }
@@ -208,8 +257,9 @@ async fn cmd_register(
     let auth: AuthResp = resp.json().await?;
     println!("registered as {} — you're logged in.", auth.handle);
     data.token = Some(auth.token);
-    data.user_id = Some(auth.user_id);
+    data.user_id = Some(auth.id);
     data.handle = Some(auth.handle);
+    ensure_prekeys_published(http, data).await?;
     Ok(())
 }
 
@@ -233,8 +283,65 @@ async fn cmd_login(http: &reqwest::Client, data: &mut VaultData, args: &[&str]) 
     let auth: AuthResp = resp.json().await?;
     println!("logged in as {}.", auth.handle);
     data.token = Some(auth.token);
-    data.user_id = Some(auth.user_id);
+    data.user_id = Some(auth.id);
     data.handle = Some(auth.handle);
+    ensure_prekeys_published(http, data).await?;
+    Ok(())
+}
+
+/// Publishes a medium-term prekey + a batch of one-time prekeys the first
+/// time this device ever logs in (if `data` already has a medium-term
+/// prekey, this is a no-op — rotating it is separate, deliberate future
+/// work, not done automatically on every login). Without this, nobody can
+/// ever start a forward-secret session with this device: `POST /prekeys`
+/// is what makes `GET /prekeys/:handle/bundle` return something other than
+/// nulls for it.
+async fn ensure_prekeys_published(http: &reqwest::Client, data: &mut VaultData) -> Result<()> {
+    if data.medium_term_x_b64.is_some() {
+        return Ok(());
+    }
+    let token = require_token(data)?.to_string();
+
+    let medium_term = veil_crypto::Prekey::generate();
+    let (mt_x_secret, mt_kem_secret) = medium_term.to_secret_bytes();
+    let (mt_x_pub, mt_kem_pub) = medium_term.public_bundle();
+    data.medium_term_x_b64 = Some(B64.encode(mt_x_secret));
+    data.medium_term_kem_b64 = Some(B64.encode(mt_kem_secret));
+
+    const ONE_TIME_COUNT: usize = 10;
+    let mut otpks_public = Vec::with_capacity(ONE_TIME_COUNT);
+    for _ in 0..ONE_TIME_COUNT {
+        let otpk = veil_crypto::Prekey::generate();
+        let (x_secret, kem_secret) = otpk.to_secret_bytes();
+        let (x_pub, kem_pub) = otpk.public_bundle();
+        data.one_time_prekeys.insert(
+            B64.encode(&x_pub),
+            (B64.encode(x_secret), B64.encode(kem_secret)),
+        );
+        otpks_public.push(serde_json::json!({
+            "xPub": B64.encode(x_pub),
+            "kemPub": B64.encode(kem_pub),
+        }));
+    }
+
+    let body = serde_json::json!({
+        "mediumTermPrekey": { "xPub": B64.encode(mt_x_pub), "kemPub": B64.encode(mt_kem_pub) },
+        "oneTimePrekeys": otpks_public,
+    });
+    let resp = http
+        .post(format!("{}/prekeys", backend_base()))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "logged in, but failed to publish prekeys — contacts won't be able to start forward-secret sessions with you until this succeeds"
+        ));
+    }
+    println!(
+        "[veil] published a medium-term prekey + {ONE_TIME_COUNT} one-time prekeys for forward-secret handshakes."
+    );
     Ok(())
 }
 
@@ -324,13 +431,25 @@ struct UserBundle {
     pq_pubkey: Option<String>,
 }
 
+// Wire envelope sent as the JSON-encoded "ciphertext" field: three shapes,
+// told apart by which keys are present rather than a strict tag, so a
+// message sent by an old build (plain {kemCt, ct}, no "kind" field at all)
+// still parses:
+//   - {"kemCt","ct"}        — legacy static hybrid scheme (e2e.rs), no
+//                             forward secrecy. Kept for contacts who
+//                             haven't published prekeys yet.
+//   - {"init","msg"}        — first message of a new forward-secret
+//                             session: an X3DH InitialMessage plus the
+//                             first RatchetedMessage sealed with it.
+//   - {"msg"}                — a subsequent message in an already-
+//                             established session.
 async fn cmd_send(
     http: &reqwest::Client,
-    data: &VaultData,
+    data: &mut VaultData,
     identity: &Identity,
     args: &[&str],
 ) -> Result<()> {
-    let token = require_token(data)?;
+    let token = require_token(data)?.to_string();
     let handle = args
         .first()
         .ok_or_else(|| anyhow!("usage: send <handle> <message...>"))?;
@@ -341,49 +460,102 @@ async fn cmd_send(
 
     let resp = http
         .get(format!("{}/auth/users/{}", backend_base(), handle))
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .send()
         .await?;
     if !resp.status().is_success() {
         return Err(anyhow!("no such user: {handle}"));
     }
     let contact: UserBundle = resp.json().await?;
-    let pq_pubkey = contact.pq_pubkey.ok_or_else(|| {
-        anyhow!("{handle} has no ML-KEM public key on file (they registered from the web prototype, which doesn't have a PQ half yet) — can't do a hybrid seal to them")
-    })?;
+    // The session map is keyed by the contact's long-term X25519 identity
+    // key (base64), not by handle — see VaultData's doc comment on
+    // `sessions` for why.
+    let session_key = contact.pubkey.clone();
 
-    let sealed: SealedMessage = veil_crypto::e2e::seal(
-        identity,
-        &B64.decode(&contact.pubkey)?,
-        &B64.decode(&pq_pubkey)?,
-        message.as_bytes(),
-    )?;
+    let (packed, nonce_b64, used_forward_secrecy) = if let Some(session) =
+        data.sessions.get_mut(&session_key)
+    {
+        let msg = session.seal(message.as_bytes())?;
+        let nonce_b64 = B64.encode(&msg.nonce);
+        (
+            serde_json::json!({ "msg": msg }).to_string(),
+            nonce_b64,
+            true,
+        )
+    } else {
+        let bundle_resp = http
+            .get(format!("{}/prekeys/{}/bundle", backend_base(), handle))
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        let bundle_json: serde_json::Value = if bundle_resp.status().is_success() {
+            bundle_resp.json().await.unwrap_or_default()
+        } else {
+            serde_json::Value::Null
+        };
+        let medium_term = bundle_json.get("mediumTermPrekey").filter(|v| !v.is_null());
 
-    // The backend's /messages route expects base64 ciphertext+nonce+
-    // senderPubkey (it was built against the web prototype's simpler
-    // crypto_box-only scheme). We pack our KEM ciphertext into the same
-    // "ciphertext" field alongside the real ciphertext, delimited, so a
-    // hybrid-aware recipient (another veil-native client) can split them
-    // back apart; a web-prototype recipient without PQ support simply
-    // can't decrypt this message, which is correct — it never had a PQ
-    // key to negotiate with in the first place.
-    let packed = serde_json::json!({
-        "kemCt": B64.encode(&sealed.kem_ciphertext),
-        "ct": B64.encode(&sealed.ciphertext),
-    })
-    .to_string();
+        match medium_term {
+            Some(mt) => {
+                let identity_x = bundle_json["identityPubkey"].as_str().unwrap_or_default();
+                let mt_x = mt["xPub"].as_str().unwrap_or_default();
+                let mt_kem = mt["kemPub"].as_str().unwrap_or_default();
+                let one_time = bundle_json.get("oneTimePrekey").filter(|v| !v.is_null());
+                let otpk_x = one_time.and_then(|o| o["xPub"].as_str());
 
+                let prekey_bundle = PrekeyBundle {
+                    identity_x_public: B64.decode(identity_x)?,
+                    medium_term_x_public: B64.decode(mt_x)?,
+                    medium_term_kem_public: B64.decode(mt_kem)?,
+                    one_time_x_public: match otpk_x {
+                        Some(s) => Some(B64.decode(s)?),
+                        None => None,
+                    },
+                };
+                let (mut session, init) = initiate_session(identity, &prekey_bundle)?;
+                let msg = session.seal(message.as_bytes())?;
+                let nonce_b64 = B64.encode(&msg.nonce);
+                data.sessions.insert(session_key.clone(), session);
+                (
+                    serde_json::json!({ "init": init, "msg": msg }).to_string(),
+                    nonce_b64,
+                    true,
+                )
+            }
+            None => {
+                let pq_pubkey = contact.pq_pubkey.clone().ok_or_else(|| {
+                    anyhow!("{handle} has no ML-KEM public key on file and no published prekeys — can't reach them at all")
+                })?;
+                let sealed: SealedMessage = veil_crypto::e2e::seal(
+                    identity,
+                    &B64.decode(&contact.pubkey)?,
+                    &B64.decode(&pq_pubkey)?,
+                    message.as_bytes(),
+                )?;
+                println!("[veil] NOTE: {handle} hasn't published forward-secret prekeys yet — sent with the static hybrid scheme instead (no forward secrecy for this one message).");
+                let nonce_b64 = B64.encode(&sealed.nonce);
+                let packed = serde_json::json!({
+                    "kemCt": B64.encode(&sealed.kem_ciphertext),
+                    "ct": B64.encode(&sealed.ciphertext),
+                })
+                .to_string();
+                (packed, nonce_b64, false)
+            }
+        }
+    };
+
+    let my_x_pub_b64 = B64.encode(identity.public_bundle().0);
     let body = serde_json::json!({
         "scope": "dm",
         "scopeId": handle,
         "recipientIds": [contact.id],
         "ciphertext": packed,
-        "nonce": B64.encode(&sealed.nonce),
-        "senderPubkey": B64.encode(&sealed.sender_x_public),
+        "nonce": nonce_b64,
+        "senderPubkey": my_x_pub_b64,
     });
     let resp = http
         .post(format!("{}/messages", backend_base()))
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .json(&body)
         .send()
         .await?;
@@ -391,8 +563,12 @@ async fn cmd_send(
         return Err(anyhow!("send failed"));
     }
     println!(
-        "sent (hybrid X25519 + ML-KEM-768 sealed, {} bytes ciphertext).",
-        sealed.ciphertext.len()
+        "sent{}.",
+        if used_forward_secrecy {
+            " (forward-secret ratchet)"
+        } else {
+            " (static hybrid, no forward secrecy)"
+        }
     );
     Ok(())
 }
@@ -409,11 +585,15 @@ struct InboxRow {
     sender_pubkey: String,
 }
 
-async fn cmd_inbox(http: &reqwest::Client, data: &VaultData, identity: &Identity) -> Result<()> {
-    let token = require_token(data)?;
+async fn cmd_inbox(
+    http: &reqwest::Client,
+    data: &mut VaultData,
+    identity: &Identity,
+) -> Result<()> {
+    let token = require_token(data)?.to_string();
     let resp = http
         .get(format!("{}/messages", backend_base()))
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .send()
         .await?;
     let rows: Vec<InboxRow> = resp.json().await?;
@@ -421,35 +601,94 @@ async fn cmd_inbox(http: &reqwest::Client, data: &VaultData, identity: &Identity
         println!("nothing waiting.");
         return Ok(());
     }
+
+    // Reconstruct this device's medium-term prekey + one-time prekey pool
+    // once for the whole inbox pass, not once per message — handshakes
+    // only ever need them, never the per-message ratchet logic itself.
+    let my_medium_term = match (&data.medium_term_x_b64, &data.medium_term_kem_b64) {
+        (Some(x), Some(k)) => Some(
+            veil_crypto::Prekey::from_secret_bytes(&B64.decode(x)?, &B64.decode(k)?)
+                .map_err(|e| anyhow!("corrupted medium-term prekey in vault: {e}"))?,
+        ),
+        _ => None,
+    };
+    let mut my_otpks: HashMap<Vec<u8>, veil_crypto::Prekey> = HashMap::new();
+    for (x_pub_b64, (x_secret_b64, kem_secret_b64)) in &data.one_time_prekeys {
+        let prekey = veil_crypto::Prekey::from_secret_bytes(
+            &B64.decode(x_secret_b64)?,
+            &B64.decode(kem_secret_b64)?,
+        )
+        .map_err(|e| anyhow!("corrupted one-time prekey in vault: {e}"))?;
+        my_otpks.insert(B64.decode(x_pub_b64)?, prekey);
+    }
+    let otpk_count_before = my_otpks.len();
+
     let mut acked = Vec::new();
     for row in &rows {
         let packed: serde_json::Value = match serde_json::from_str(&row.ciphertext) {
             Ok(v) => v,
             Err(_) => {
-                println!("[{}] (not a hybrid-packed message — skipping, likely from the web prototype's simpler scheme)", row.id);
+                println!("[{}] (unreadable message body — skipping)", row.id);
                 continue;
             }
         };
-        let kem_ct = B64.decode(packed["kemCt"].as_str().unwrap_or_default())?;
-        let ct = B64.decode(packed["ct"].as_str().unwrap_or_default())?;
-        let sealed = SealedMessage {
-            sender_x_public: B64.decode(&row.sender_pubkey)?,
-            kem_ciphertext: kem_ct,
-            nonce: B64.decode(&row.nonce)?,
-            ciphertext: ct,
+
+        let plaintext: Result<Vec<u8>> = if packed.get("kemCt").is_some() {
+            (|| -> Result<Vec<u8>> {
+                let kem_ct = B64.decode(packed["kemCt"].as_str().unwrap_or_default())?;
+                let ct = B64.decode(packed["ct"].as_str().unwrap_or_default())?;
+                let sealed = SealedMessage {
+                    sender_x_public: B64.decode(&row.sender_pubkey)?,
+                    kem_ciphertext: kem_ct,
+                    nonce: B64.decode(&row.nonce)?,
+                    ciphertext: ct,
+                };
+                Ok(veil_crypto::e2e::open(identity, &sealed)?)
+            })()
+        } else if let Some(init_val) = packed.get("init") {
+            (|| -> Result<Vec<u8>> {
+                let my_mt = my_medium_term.as_ref().ok_or_else(|| {
+                    anyhow!("received a handshake but this device has no medium-term prekey — run `register`/`login` again to publish one")
+                })?;
+                let init: veil_crypto::InitialMessage = serde_json::from_value(init_val.clone())?;
+                let msg: veil_crypto::RatchetedMessage =
+                    serde_json::from_value(packed["msg"].clone())?;
+                let mut session = accept_session(identity, my_mt, &mut my_otpks, &init)?;
+                let plaintext = session.open(&msg)?;
+                data.sessions.insert(row.sender_pubkey.clone(), session);
+                Ok(plaintext)
+            })()
+        } else if let Some(msg_val) = packed.get("msg") {
+            (|| -> Result<Vec<u8>> {
+                let msg: veil_crypto::RatchetedMessage = serde_json::from_value(msg_val.clone())?;
+                let session = data.sessions.get_mut(&row.sender_pubkey).ok_or_else(|| {
+                    anyhow!("no session for this sender yet (their handshake message may have arrived out of order, or wasn't received) — can't decrypt")
+                })?;
+                Ok(session.open(&msg)?)
+            })()
+        } else {
+            Err(anyhow!("unrecognized message envelope shape"))
         };
-        match veil_crypto::e2e::open(identity, &sealed) {
+
+        match plaintext {
             Ok(plaintext) => println!("  {}", String::from_utf8_lossy(&plaintext)),
-            Err(_) => println!(
-                "  (could not decrypt {} — wrong identity for this message)",
-                row.id
-            ),
+            Err(e) => println!("  (could not decrypt {}: {e})", row.id),
         }
         acked.push(row.id.clone());
     }
+
+    // Persist any one-time prekeys consumed by handshakes accepted above —
+    // removed from the live map, removed from the vault too, so a reused
+    // `InitialMessage` can never be accepted twice.
+    if my_otpks.len() != otpk_count_before {
+        let still_live: std::collections::HashSet<String> =
+            my_otpks.keys().map(|k| B64.encode(k)).collect();
+        data.one_time_prekeys.retain(|k, _| still_live.contains(k));
+    }
+
     if !acked.is_empty() {
         http.post(format!("{}/messages/ack", backend_base()))
-            .bearer_auth(token)
+            .bearer_auth(&token)
             .json(&serde_json::json!({ "ids": acked }))
             .send()
             .await?;
