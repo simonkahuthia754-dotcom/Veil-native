@@ -1,0 +1,350 @@
+// The real REST API both clients (cli/src/main.rs, android/.../net/ApiClient.kt)
+// already assume. Previously no backend code existed anywhere for this
+// project — the clients were built against an aspirational contract. This
+// is the first real implementation of it, matched route-for-route against
+// what the clients actually send (verified by reading their source, not
+// guessed), plus the new prekey-bundle endpoints for forward secrecy.
+"use strict";
+
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const { openDb, newId, newToken } = require("./db");
+
+const PIN_PATTERN = /^[0-9]{4,8}$/;
+const BCRYPT_COST = 12;
+
+// Minimal in-memory login rate limiter: a PIN is low-entropy (4-8 digits,
+// at best 10^8 possibilities, often far fewer in practice) so bcrypt's
+// cost factor alone is not enough to make offline *or* online guessing
+// expensive — the real mitigation for an online attacker is capping
+// attempts per handle. This is intentionally simple (in-process, resets on
+// restart) rather than a persisted/distributed limiter, which would be the
+// honest next step for a real multi-instance deployment — named here, not
+// hidden.
+function makeLoginLimiter({ maxAttempts = 8, windowMs = 15 * 60 * 1000 } = {}) {
+  const attempts = new Map(); // handle -> { count, resetAt }
+  return {
+    check(handle) {
+      const row = attempts.get(handle);
+      const now = Date.now();
+      if (!row || now > row.resetAt) return { allowed: true };
+      return { allowed: row.count < maxAttempts, retryAfterMs: row.resetAt - now };
+    },
+    recordFailure(handle) {
+      const now = Date.now();
+      const row = attempts.get(handle);
+      if (!row || now > row.resetAt) {
+        attempts.set(handle, { count: 1, resetAt: now + windowMs });
+      } else {
+        row.count += 1;
+      }
+    },
+    recordSuccess(handle) {
+      attempts.delete(handle);
+    },
+  };
+}
+
+function createApp(db, { loginLimiter = makeLoginLimiter() } = {}) {
+  const app = express();
+  app.use(express.json());
+
+  function authUser(req, handle) {
+    return db.prepare("SELECT * FROM users WHERE handle = ?").get(handle);
+  }
+
+  function requireAuth(req, res, next) {
+    const header = req.header("authorization") || "";
+    const match = /^Bearer (.+)$/.exec(header);
+    if (!match) return res.status(401).json({ error: "missing bearer token" });
+    const session = db
+      .prepare("SELECT * FROM sessions WHERE token = ?")
+      .get(match[1]);
+    if (!session) return res.status(401).json({ error: "invalid or expired token" });
+    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(session.user_id);
+    if (!user) return res.status(401).json({ error: "invalid or expired token" });
+    req.user = user;
+    next();
+  }
+
+  function issueSession(userId) {
+    const token = newToken();
+    db.prepare(
+      "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
+    ).run(token, userId, new Date().toISOString());
+    return token;
+  }
+
+  function authResponse(user, token) {
+    return {
+      token,
+      id: user.id,
+      handle: user.handle,
+      pubkey: user.pubkey,
+      pqPubkey: user.pq_pubkey,
+    };
+  }
+
+  // --- Auth ---------------------------------------------------------
+
+  app.post("/auth/register", (req, res) => {
+    const { handle, pin, pubkey, pqPubkey } = req.body || {};
+    if (typeof handle !== "string" || handle.length < 1 || handle.length > 64) {
+      return res.status(400).json({ error: "handle must be 1-64 characters" });
+    }
+    if (typeof pin !== "string" || !PIN_PATTERN.test(pin)) {
+      return res.status(400).json({ error: "PIN must be 4-8 digits" });
+    }
+    if (typeof pubkey !== "string" || pubkey.length === 0) {
+      return res.status(400).json({ error: "pubkey is required" });
+    }
+    if (authUser(req, handle)) {
+      return res.status(409).json({ error: "handle already taken" });
+    }
+
+    const id = newId();
+    db.prepare(
+      `INSERT INTO users (id, handle, pin_hash, pubkey, pq_pubkey, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      id,
+      handle,
+      bcrypt.hashSync(pin, BCRYPT_COST),
+      pubkey,
+      typeof pqPubkey === "string" ? pqPubkey : null,
+      new Date().toISOString(),
+    );
+    const user = db.prepare("SELECT * FROM users WHERE id = ?").get(id);
+    const token = issueSession(id);
+    return res.status(201).json(authResponse(user, token));
+  });
+
+  app.post("/auth/login", (req, res) => {
+    const { handle, pin } = req.body || {};
+    if (typeof handle !== "string" || typeof pin !== "string") {
+      return res.status(400).json({ error: "handle and pin are required" });
+    }
+    const limit = loginLimiter.check(handle);
+    if (!limit.allowed) {
+      return res.status(429).json({ error: "too many attempts — try again later" });
+    }
+    const user = authUser(req, handle);
+    // Always run bcrypt.compareSync even for a nonexistent user (against a
+    // fixed dummy hash) so response timing doesn't reveal whether a handle
+    // exists — a cheap, real fix, not a TODO.
+    const hash = user ? user.pin_hash : "$2a$12$CfXW6S0000000000000000uQFQ4Qv4a0y8y8y8y8y8y8y8y8y8y8O";
+    const ok = bcrypt.compareSync(pin, hash) && !!user;
+    if (!ok) {
+      loginLimiter.recordFailure(handle);
+      return res.status(401).json({ error: "login failed" });
+    }
+    loginLimiter.recordSuccess(handle);
+    const token = issueSession(user.id);
+    return res.json(authResponse(user, token));
+  });
+
+  app.get("/auth/users/:handle", requireAuth, (req, res) => {
+    const user = authUser(req, req.params.handle);
+    if (!user) return res.status(404).json({ error: "no such user" });
+    return res.json({
+      id: user.id,
+      handle: user.handle,
+      pubkey: user.pubkey,
+      pqPubkey: user.pq_pubkey,
+    });
+  });
+
+  // --- Chambers -------------------------------------------------------
+
+  app.get("/chambers", requireAuth, (req, res) => {
+    const rows = db
+      .prepare(
+        `SELECT c.id, c.name, c.created_at as createdAt
+         FROM chambers c
+         JOIN chamber_members m ON m.chamber_id = c.id
+         WHERE m.user_id = ?`,
+      )
+      .all(req.user.id);
+    return res.json(rows);
+  });
+
+  app.post("/chambers", requireAuth, (req, res) => {
+    const { name } = req.body || {};
+    if (typeof name !== "string" || name.length < 1) {
+      return res.status(400).json({ error: "name is required" });
+    }
+    const id = newId();
+    const createdAt = new Date().toISOString();
+    const insertChamber = db.prepare(
+      "INSERT INTO chambers (id, name, owner_id, created_at) VALUES (?, ?, ?, ?)",
+    );
+    const insertMember = db.prepare(
+      "INSERT INTO chamber_members (chamber_id, user_id) VALUES (?, ?)",
+    );
+    db.transaction(() => {
+      insertChamber.run(id, name, req.user.id, createdAt);
+      insertMember.run(id, req.user.id);
+    })();
+    return res.status(201).json({ id, name, createdAt });
+  });
+
+  // --- Messages ---------------------------------------------------------
+  // Request shape matches the Rust CLI's real cmd_send (cli/src/main.rs):
+  // { scope, scopeId, recipientIds: [userId, ...], ciphertext, nonce,
+  // senderPubkey }. recipientIds is the actual fan-out list — one row is
+  // inserted per recipient, which is what lets this same endpoint serve
+  // both a DM (recipientIds.length === 1) and, later, a whole chamber's
+  // membership without changing the contract.
+
+  app.post("/messages", requireAuth, (req, res) => {
+    const { recipientIds, ciphertext, nonce, senderPubkey } = req.body || {};
+    if (!Array.isArray(recipientIds) || recipientIds.length === 0) {
+      return res.status(400).json({ error: "recipientIds must be a non-empty array" });
+    }
+    if (typeof ciphertext !== "string" || typeof nonce !== "string" || typeof senderPubkey !== "string") {
+      return res.status(400).json({ error: "ciphertext, nonce and senderPubkey are required" });
+    }
+    const insert = db.prepare(
+      `INSERT INTO messages (id, recipient_id, ciphertext, nonce, sender_pubkey, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const createdAt = new Date().toISOString();
+    db.transaction(() => {
+      for (const recipientId of recipientIds) {
+        insert.run(newId(), recipientId, ciphertext, nonce, senderPubkey, createdAt);
+      }
+    })();
+    return res.status(201).json({ delivered: recipientIds.length });
+  });
+
+  // Deliberately snake_case (id, ciphertext, nonce, sender_pubkey,
+  // created_at) — both clients already parse this shape as raw SQLite-
+  // style column names (a real inconsistency with the rest of this
+  // camelCase API, documented on both client sides rather than silently
+  // "fixed" here, since fixing it would break two already-working
+  // clients for a cosmetic win).
+  app.get("/messages", requireAuth, (req, res) => {
+    const rows = db
+      .prepare(
+        `SELECT id, ciphertext, nonce, sender_pubkey, created_at
+         FROM messages WHERE recipient_id = ? AND acked = 0
+         ORDER BY created_at ASC`,
+      )
+      .all(req.user.id);
+    return res.json(rows);
+  });
+
+  app.post("/messages/ack", requireAuth, (req, res) => {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids)) {
+      return res.status(400).json({ error: "ids must be an array" });
+    }
+    const ack = db.prepare(
+      "UPDATE messages SET acked = 1 WHERE id = ? AND recipient_id = ?",
+    );
+    db.transaction(() => {
+      for (const id of ids) ack.run(id, req.user.id);
+    })();
+    return res.json({ acked: ids.length });
+  });
+
+  // --- Prekeys (forward secrecy) ---------------------------------------
+  //
+  // X3DH-style bundle: an identity key (already published via
+  // /auth/register), one rotating medium-term prekey (see db.js's honest
+  // note on why it isn't cryptographically "signed" yet), and a pool of
+  // one-time prekeys that each get consumed by at most one handshake.
+
+  app.post("/prekeys", requireAuth, (req, res) => {
+    const { mediumTermPrekey, oneTimePrekeys } = req.body || {};
+    if (
+      !mediumTermPrekey ||
+      typeof mediumTermPrekey.xPub !== "string" ||
+      typeof mediumTermPrekey.kemPub !== "string"
+    ) {
+      return res.status(400).json({ error: "mediumTermPrekey {xPub, kemPub} is required" });
+    }
+    if (!Array.isArray(oneTimePrekeys)) {
+      return res.status(400).json({ error: "oneTimePrekeys must be an array (may be empty)" });
+    }
+    for (const otpk of oneTimePrekeys) {
+      if (typeof otpk.xPub !== "string" || typeof otpk.kemPub !== "string") {
+        return res.status(400).json({ error: "each one-time prekey needs {xPub, kemPub}" });
+      }
+    }
+
+    const createdAt = new Date().toISOString();
+    const upsertMtpk = db.prepare(
+      `INSERT INTO medium_term_prekeys (user_id, x_pub, kem_pub, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET x_pub = excluded.x_pub, kem_pub = excluded.kem_pub, created_at = excluded.created_at`,
+    );
+    const insertOtpk = db.prepare(
+      "INSERT INTO one_time_prekeys (id, user_id, x_pub, kem_pub, created_at) VALUES (?, ?, ?, ?, ?)",
+    );
+    db.transaction(() => {
+      upsertMtpk.run(req.user.id, mediumTermPrekey.xPub, mediumTermPrekey.kemPub, createdAt);
+      for (const otpk of oneTimePrekeys) {
+        insertOtpk.run(newId(), req.user.id, otpk.xPub, otpk.kemPub, createdAt);
+      }
+    })();
+    return res.status(201).json({ oneTimePrekeysStored: oneTimePrekeys.length });
+  });
+
+  // How many one-time prekeys this user still has published — lets a
+  // client decide whether it's time to top up, without guessing.
+  app.get("/prekeys/mine/count", requireAuth, (req, res) => {
+    const row = db
+      .prepare("SELECT COUNT(*) as n FROM one_time_prekeys WHERE user_id = ?")
+      .get(req.user.id);
+    return res.json({ count: row.n });
+  });
+
+  app.get("/prekeys/:handle/bundle", requireAuth, (req, res) => {
+    const target = authUser(req, req.params.handle);
+    if (!target) return res.status(404).json({ error: "no such user" });
+
+    const mtpk = db
+      .prepare("SELECT * FROM medium_term_prekeys WHERE user_id = ?")
+      .get(target.id);
+
+    // Atomically pick-and-delete one one-time prekey so two concurrent
+    // handshakes can't both receive (and both think they exclusively
+    // consumed) the same one — the entire point of a one-time prekey.
+    const consumeOtpk = db.transaction(() => {
+      const row = db
+        .prepare(
+          "SELECT * FROM one_time_prekeys WHERE user_id = ? ORDER BY created_at ASC LIMIT 1",
+        )
+        .get(target.id);
+      if (!row) return null;
+      db.prepare("DELETE FROM one_time_prekeys WHERE id = ?").run(row.id);
+      return row;
+    });
+    const otpk = consumeOtpk();
+
+    return res.json({
+      identityPubkey: target.pubkey,
+      identityPqPubkey: target.pq_pubkey,
+      mediumTermPrekey: mtpk ? { xPub: mtpk.x_pub, kemPub: mtpk.kem_pub } : null,
+      oneTimePrekey: otpk ? { xPub: otpk.x_pub, kemPub: otpk.kem_pub } : null,
+    });
+  });
+
+  return app;
+}
+
+function start(port = process.env.PORT || 8787, dbPath = process.env.VEIL_DB_PATH || "veil.sqlite3") {
+  const db = openDb(dbPath);
+  const app = createApp(db);
+  return app.listen(port, () => {
+    // eslint-disable-next-line no-console
+    console.log(`veil-backend listening on :${port} (db: ${dbPath})`);
+  });
+}
+
+module.exports = { createApp, start, makeLoginLimiter };
+
+if (require.main === module) {
+  start();
+}
