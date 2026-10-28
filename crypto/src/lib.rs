@@ -16,8 +16,13 @@
 
 pub mod e2e;
 pub mod lock;
+pub mod session;
 pub mod storage;
 
 pub use e2e::{Identity, SealedMessage};
 pub use lock::{AppLock, LockError};
+pub use session::{
+    accept as accept_session, initiate as initiate_session, InitialMessage, Prekey, PrekeyBundle,
+    RatchetedMessage, Session, SessionError,
+};
 pub use storage::{SecureStore, StorageError};

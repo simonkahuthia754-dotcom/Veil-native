@@ -85,6 +85,18 @@ impl Identity {
             self.kem_ek.to_bytes().to_vec(),
         )
     }
+
+    /// Crate-internal access to the private halves, for `session.rs`'s
+    /// X3DH-style handshake, which needs to run its own DH/decapsulation
+    /// operations against this identity's long-term secret keys alongside
+    /// a medium-term/one-time prekey's. Not `pub`: nothing outside this
+    /// crate should ever touch these directly.
+    pub(crate) fn x_secret(&self) -> &XSecretKey {
+        &self.x_secret
+    }
+    pub(crate) fn kem_dk(&self) -> &<MlKem768 as Kem>::DecapsulationKey {
+        &self.kem_dk
+    }
 }
 
 /// A message, sealed for one specific recipient.
