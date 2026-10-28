@@ -22,15 +22,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: "npm"
-          cache-dependency-path: backend/package-lock.json
-
-      # No package-lock.json is committed yet — this sandbox has no network
-      # access to the npm registry to generate one honestly (same reason
-      # the Android side has no committed gradlew wrapper jar — see repo
-      # root README "Honest gaps"). `npm install` resolves fresh against
-      # package.json's ranges here instead of `npm ci`; pinning exact
-      # versions via a committed lockfile is a tracked follow-up.
+          # NOT cache: "npm" — that requires a package-lock.json to hash,
+          # and CI itself proved there isn't one (actions/setup-node failed
+          # outright: "Some specified paths were not resolved, unable to
+          # cache dependencies"). No package-lock.json is committed yet —
+          # this sandbox has no network access to the npm registry to
+          # generate one honestly (same reason the Android side has no
+          # committed gradlew wrapper jar — see repo root README "Honest
+          # gaps"). `npm install` resolves fresh against package.json's
+          # ranges here instead of `npm ci`; pinning exact versions via a
+          # committed lockfile, generated once CI confirms the deps
+          # resolve, is a tracked follow-up.
       - name: Install dependencies
         run: npm install
 
