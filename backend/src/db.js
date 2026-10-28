@@ -89,6 +89,26 @@ function openDb(path) {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_otpk_user ON one_time_prekeys(user_id);
+
+    -- Audit trail for the intrusion-deception layer (see maze.js): every
+    -- scored event (a decoy route hit, a malicious-looking payload, a
+    -- ban, a tarpit) gets a row here, real and persisted, not just
+    -- printed to a log an operator might never read. client_key is
+    -- whatever maze.js keyed the threat score by (IP, or a bearer token
+    -- prefix when present) -- never the full token, so this table itself
+    -- isn't a second place a leaked session token would be usable from.
+    CREATE TABLE IF NOT EXISTS security_events (
+      id TEXT PRIMARY KEY,
+      client_key TEXT NOT NULL,
+      path TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      score_delta INTEGER NOT NULL,
+      score_total INTEGER NOT NULL,
+      action TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_security_events_client ON security_events(client_key);
+    CREATE INDEX IF NOT EXISTS idx_security_events_created ON security_events(created_at);
   `);
 
   return db;

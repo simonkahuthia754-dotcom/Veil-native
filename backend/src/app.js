@@ -9,6 +9,7 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const { openDb, newId, newToken } = require("./db");
+const maze = require("./maze");
 
 const PIN_PATTERN = /^[0-9]{4,8}$/;
 const BCRYPT_COST = 12;
@@ -53,9 +54,18 @@ function makeLoginLimiter({ maxAttempts = 8, windowMs = 15 * 60 * 1000 } = {}) {
   };
 }
 
-function createApp(db, { loginLimiter = makeLoginLimiter() } = {}) {
+function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new maze.ThreatTracker() } = {}) {
   const app = express();
   app.use(express.json());
+
+  // The Maze (see maze.js): scores every request for decoy-path hits and
+  // attack-shaped payloads, right after body parsing so req.body is
+  // available to scan, and before any real route runs. Its own
+  // counterpart — the thing that actually serves fake data instead of a
+  // 404 to anyone it flags — is mounted at the very bottom of this
+  // function, after every real route is registered, since Express only
+  // falls through to it when nothing above matched.
+  app.use(maze.scoringMiddleware(db, threatTracker));
 
   function authUser(req, handle) {
     return db.prepare("SELECT * FROM users WHERE handle = ?").get(handle);
@@ -338,6 +348,15 @@ function createApp(db, { loginLimiter = makeLoginLimiter() } = {}) {
       oneTimePrekey: otpk ? { xPub: otpk.x_pub, kemPub: otpk.kem_pub } : null,
     });
   });
+
+  // Operator-only audit trail for the Maze. Deliberately not under
+  // /admin — see maze.js's note on why that path is bait, not real.
+  app.get("/ops/security-events", maze.securityEventsRoute(db));
+
+  // Must be LAST: Express only reaches a bare app.use(...) once nothing
+  // above it matched, which is exactly the "this wasn't a real route"
+  // signal the Maze's catch-all needs.
+  app.use(maze.catchAllMiddleware(threatTracker));
 
   return app;
 }
