@@ -168,7 +168,9 @@ async fn main() -> Result<()> {
             "careers" => cmd_careers(&http).await,
             "chambers" => cmd_chambers(&http, &data).await,
             "create-chamber" => cmd_create_chamber(&http, &data, &rest).await,
+            "invite" => cmd_invite(&http, &data, &rest).await,
             "send" => cmd_send(&http, &mut data, &identity, &rest).await,
+            "chamber-send" => cmd_chamber_send(&http, &mut data, &identity, &rest).await,
             "inbox" => cmd_inbox(&http, &mut data, &identity).await,
             "lock" => {
                 cmd_lock_demo();
@@ -199,7 +201,9 @@ fn print_help() {
   careers                     list chamber categories the server knows about
   chambers                    list chambers you've joined / can see
   create-chamber <name>       create a new chamber
+  invite <chamber-id> <handle>        invite an existing user into a chamber you're in
   send <handle> <message...>  encrypt and send a direct message
+  chamber-send <chamber-id> <message...>  encrypt and fan a message out to every chamber member
   inbox                       fetch + decrypt + ack any waiting messages
   lock                        demo of the Argon2id app-lock + duress + auto-wipe logic
   quit                        exit
@@ -367,8 +371,16 @@ struct ChamberRow {
     name: String,
     #[serde(rename = "memberCount")]
     member_count: i64,
+    // A real JSON boolean from the backend (backend/src/app.js's
+    // `isMember: true`), not a number — this struct previously declared
+    // it as `i64`, which would have failed to deserialize the moment the
+    // backend actually started sending the field (it never had before
+    // now: GET /chambers returning memberCount/isMember at all was a
+    // named README gap until this change closed it). Caught by actually
+    // implementing the backend side instead of just the client-side
+    // shape.
     #[serde(rename = "isMember")]
-    is_member: i64,
+    is_member: bool,
 }
 
 async fn cmd_chambers(http: &reqwest::Client, data: &VaultData) -> Result<()> {
@@ -387,11 +399,7 @@ async fn cmd_chambers(http: &reqwest::Client, data: &VaultData) -> Result<()> {
             "{}  {} members  {}  [{}]",
             r.name,
             r.member_count,
-            if r.is_member != 0 {
-                "joined"
-            } else {
-                "not joined"
-            },
+            if r.is_member { "joined" } else { "not joined" },
             r.id
         );
     }
@@ -431,6 +439,15 @@ struct UserBundle {
     pq_pubkey: Option<String>,
 }
 
+#[derive(Deserialize, Clone)]
+struct ChamberMember {
+    id: String,
+    handle: String,
+    pubkey: String,
+    #[serde(rename = "pqPubkey")]
+    pq_pubkey: Option<String>,
+}
+
 // Wire envelope sent as the JSON-encoded "ciphertext" field: three shapes,
 // told apart by which keys are present rather than a strict tag, so a
 // message sent by an old build (plain {kemCt, ct}, no "kind" field at all)
@@ -443,6 +460,13 @@ struct UserBundle {
 //                             first RatchetedMessage sealed with it.
 //   - {"msg"}                — a subsequent message in an already-
 //                             established session.
+//
+// Shared by both DM send and chamber fan-out send (below): sealing is
+// always pairwise (this is X3DH + a per-pair ratchet, not a group key),
+// so fanning a message out to a chamber means calling this once per
+// member and POSTing once per member too — never one POST with multiple
+// recipientIds and one shared ciphertext, which would be cryptographically
+// wrong for this scheme (every recipient needs their own sealed copy).
 async fn cmd_send(
     http: &reqwest::Client,
     data: &mut VaultData,
@@ -467,82 +491,18 @@ async fn cmd_send(
         return Err(anyhow!("no such user: {handle}"));
     }
     let contact: UserBundle = resp.json().await?;
-    // The session map is keyed by the contact's long-term X25519 identity
-    // key (base64), not by handle — see VaultData's doc comment on
-    // `sessions` for why.
-    let session_key = contact.pubkey.clone();
 
-    let (packed, nonce_b64, used_forward_secrecy) = if let Some(session) =
-        data.sessions.get_mut(&session_key)
-    {
-        let msg = session.seal(message.as_bytes())?;
-        let nonce_b64 = B64.encode(&msg.nonce);
-        (
-            serde_json::json!({ "msg": msg }).to_string(),
-            nonce_b64,
-            true,
-        )
-    } else {
-        let bundle_resp = http
-            .get(format!("{}/prekeys/{}/bundle", backend_base(), handle))
-            .bearer_auth(&token)
-            .send()
-            .await?;
-        let bundle_json: serde_json::Value = if bundle_resp.status().is_success() {
-            bundle_resp.json().await.unwrap_or_default()
-        } else {
-            serde_json::Value::Null
-        };
-        let medium_term = bundle_json.get("mediumTermPrekey").filter(|v| !v.is_null());
-
-        match medium_term {
-            Some(mt) => {
-                let identity_x = bundle_json["identityPubkey"].as_str().unwrap_or_default();
-                let mt_x = mt["xPub"].as_str().unwrap_or_default();
-                let mt_kem = mt["kemPub"].as_str().unwrap_or_default();
-                let one_time = bundle_json.get("oneTimePrekey").filter(|v| !v.is_null());
-                let otpk_x = one_time.and_then(|o| o["xPub"].as_str());
-
-                let prekey_bundle = PrekeyBundle {
-                    identity_x_public: B64.decode(identity_x)?,
-                    medium_term_x_public: B64.decode(mt_x)?,
-                    medium_term_kem_public: B64.decode(mt_kem)?,
-                    one_time_x_public: match otpk_x {
-                        Some(s) => Some(B64.decode(s)?),
-                        None => None,
-                    },
-                };
-                let (mut session, init) = initiate_session(identity, &prekey_bundle)?;
-                let msg = session.seal(message.as_bytes())?;
-                let nonce_b64 = B64.encode(&msg.nonce);
-                data.sessions.insert(session_key.clone(), session);
-                (
-                    serde_json::json!({ "init": init, "msg": msg }).to_string(),
-                    nonce_b64,
-                    true,
-                )
-            }
-            None => {
-                let pq_pubkey = contact.pq_pubkey.clone().ok_or_else(|| {
-                    anyhow!("{handle} has no ML-KEM public key on file and no published prekeys — can't reach them at all")
-                })?;
-                let sealed: SealedMessage = veil_crypto::e2e::seal(
-                    identity,
-                    &B64.decode(&contact.pubkey)?,
-                    &B64.decode(&pq_pubkey)?,
-                    message.as_bytes(),
-                )?;
-                println!("[veil] NOTE: {handle} hasn't published forward-secret prekeys yet — sent with the static hybrid scheme instead (no forward secrecy for this one message).");
-                let nonce_b64 = B64.encode(&sealed.nonce);
-                let packed = serde_json::json!({
-                    "kemCt": B64.encode(&sealed.kem_ciphertext),
-                    "ct": B64.encode(&sealed.ciphertext),
-                })
-                .to_string();
-                (packed, nonce_b64, false)
-            }
-        }
-    };
+    let (packed, nonce_b64, used_forward_secrecy) = seal_for_one(
+        http,
+        data,
+        identity,
+        &token,
+        handle,
+        &contact.pubkey,
+        contact.pq_pubkey.as_deref(),
+        &message,
+    )
+    .await?;
 
     let my_x_pub_b64 = B64.encode(identity.public_bundle().0);
     let body = serde_json::json!({
@@ -570,6 +530,227 @@ async fn cmd_send(
             " (static hybrid, no forward secrecy)"
         }
     );
+    Ok(())
+}
+
+/// The actual per-recipient sealing logic (session lookup, X3DH handshake,
+/// or static-scheme fallback) shared by `cmd_send` (one DM) and
+/// `cmd_chamber_send` (one call per chamber member). Returns
+/// (packed ciphertext JSON, nonce b64, used_forward_secrecy).
+async fn seal_for_one(
+    http: &reqwest::Client,
+    data: &mut VaultData,
+    identity: &Identity,
+    token: &str,
+    recipient_handle: &str,
+    recipient_pubkey_b64: &str,
+    recipient_pq_pubkey_b64: Option<&str>,
+    message: &str,
+) -> Result<(String, String, bool)> {
+    // The session map is keyed by the recipient's long-term X25519
+    // identity key (base64), not by handle — see VaultData's doc comment
+    // on `sessions` for why.
+    let session_key = recipient_pubkey_b64.to_string();
+
+    if let Some(session) = data.sessions.get_mut(&session_key) {
+        let msg = session.seal(message.as_bytes())?;
+        let nonce_b64 = B64.encode(&msg.nonce);
+        return Ok((
+            serde_json::json!({ "msg": msg }).to_string(),
+            nonce_b64,
+            true,
+        ));
+    }
+
+    let bundle_resp = http
+        .get(format!(
+            "{}/prekeys/{}/bundle",
+            backend_base(),
+            recipient_handle
+        ))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    let bundle_json: serde_json::Value = if bundle_resp.status().is_success() {
+        bundle_resp.json().await.unwrap_or_default()
+    } else {
+        serde_json::Value::Null
+    };
+    let medium_term = bundle_json.get("mediumTermPrekey").filter(|v| !v.is_null());
+
+    if let Some(mt) = medium_term {
+        let identity_x = bundle_json["identityPubkey"].as_str().unwrap_or_default();
+        let mt_x = mt["xPub"].as_str().unwrap_or_default();
+        let mt_kem = mt["kemPub"].as_str().unwrap_or_default();
+        let one_time = bundle_json.get("oneTimePrekey").filter(|v| !v.is_null());
+        let otpk_x = one_time.and_then(|o| o["xPub"].as_str());
+
+        let prekey_bundle = PrekeyBundle {
+            identity_x_public: B64.decode(identity_x)?,
+            medium_term_x_public: B64.decode(mt_x)?,
+            medium_term_kem_public: B64.decode(mt_kem)?,
+            one_time_x_public: match otpk_x {
+                Some(s) => Some(B64.decode(s)?),
+                None => None,
+            },
+        };
+        let (mut session, init) = initiate_session(identity, &prekey_bundle)?;
+        let msg = session.seal(message.as_bytes())?;
+        let nonce_b64 = B64.encode(&msg.nonce);
+        data.sessions.insert(session_key.clone(), session);
+        return Ok((
+            serde_json::json!({ "init": init, "msg": msg }).to_string(),
+            nonce_b64,
+            true,
+        ));
+    }
+
+    let pq_pubkey = recipient_pq_pubkey_b64.ok_or_else(|| {
+        anyhow!("{recipient_handle} has no ML-KEM public key on file and no published prekeys — can't reach them at all")
+    })?;
+    let sealed: SealedMessage = veil_crypto::e2e::seal(
+        identity,
+        &B64.decode(recipient_pubkey_b64)?,
+        &B64.decode(pq_pubkey)?,
+        message.as_bytes(),
+    )?;
+    println!("[veil] NOTE: {recipient_handle} hasn't published forward-secret prekeys yet — sent with the static hybrid scheme instead (no forward secrecy for this one message).");
+    let nonce_b64 = B64.encode(&sealed.nonce);
+    let packed = serde_json::json!({
+        "kemCt": B64.encode(&sealed.kem_ciphertext),
+        "ct": B64.encode(&sealed.ciphertext),
+    })
+    .to_string();
+    Ok((packed, nonce_b64, false))
+}
+
+async fn cmd_chamber_send(
+    http: &reqwest::Client,
+    data: &mut VaultData,
+    identity: &Identity,
+    args: &[&str],
+) -> Result<()> {
+    let token = require_token(data)?.to_string();
+    let chamber_id = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: chamber-send <chamber-id> <message...>"))?
+        .to_string();
+    let message = args[1..].join(" ");
+    if message.is_empty() {
+        return Err(anyhow!("usage: chamber-send <chamber-id> <message...>"));
+    }
+
+    let resp = http
+        .get(format!(
+            "{}/chambers/{}/members",
+            backend_base(),
+            chamber_id
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "no such chamber, or you aren't a member of it: {chamber_id}"
+        ));
+    }
+    let members: Vec<ChamberMember> = resp.json().await?;
+    let my_id = data.user_id.clone();
+    let my_x_pub_b64 = B64.encode(identity.public_bundle().0);
+
+    // Sealing is pairwise, so this is genuinely one handshake-or-ratchet
+    // step and one POST per member — not one shared ciphertext, which
+    // would be wrong for this scheme (see seal_for_one's doc comment).
+    // Each member's failure (no prekeys AND no PQ key on file, a network
+    // hiccup, whatever) is reported and skipped rather than aborting the
+    // whole send — a chamber with nine reachable members and one
+    // unreachable one should still deliver to the nine.
+    let mut sent = 0;
+    let mut failed = Vec::new();
+    for member in &members {
+        if Some(&member.id) == my_id.as_ref() {
+            continue; // never seal a copy to ourselves
+        }
+        let result = seal_for_one(
+            http,
+            data,
+            identity,
+            &token,
+            &member.handle,
+            &member.pubkey,
+            member.pq_pubkey.as_deref(),
+            &message,
+        )
+        .await;
+        let (packed, nonce_b64, _used_forward_secrecy) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                failed.push(member.handle.clone());
+                eprintln!("  (couldn't seal for {}: {e})", member.handle);
+                continue;
+            }
+        };
+        let body = serde_json::json!({
+            "scope": "chamber",
+            "scopeId": chamber_id,
+            "recipientIds": [member.id],
+            "ciphertext": packed,
+            "nonce": nonce_b64,
+            "senderPubkey": my_x_pub_b64,
+        });
+        let send_resp = http
+            .post(format!("{}/messages", backend_base()))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await?;
+        if send_resp.status().is_success() {
+            sent += 1;
+        } else {
+            failed.push(member.handle.clone());
+        }
+    }
+
+    println!(
+        "sent to {sent}/{} chamber member(s){}.",
+        members.len().saturating_sub(my_id.is_some() as usize),
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!(" — failed: {}", failed.join(", "))
+        }
+    );
+    Ok(())
+}
+
+async fn cmd_invite(http: &reqwest::Client, data: &VaultData, args: &[&str]) -> Result<()> {
+    let token = require_token(data)?;
+    let chamber_id = args
+        .first()
+        .ok_or_else(|| anyhow!("usage: invite <chamber-id> <handle>"))?;
+    let handle = args
+        .get(1)
+        .ok_or_else(|| anyhow!("usage: invite <chamber-id> <handle>"))?;
+    let resp = http
+        .post(format!(
+            "{}/chambers/{}/members",
+            backend_base(),
+            chamber_id
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "handle": handle }))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let msg: serde_json::Value = resp.json().await.unwrap_or_default();
+        return Err(anyhow!(
+            "{}",
+            msg.get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("could not invite")
+        ));
+    }
+    println!("invited {handle}.");
     Ok(())
 }
 
