@@ -201,3 +201,78 @@ test("requests without a bearer token are rejected", async (t) => {
     assert.equal(res.status, 401);
   });
 });
+
+test("chamber fan-out: invite, member list, and non-members can't see either", async (t) => {
+  await withServer(t, async (base) => {
+    const owner = await register(base, "owner1", "1234");
+    const invitee = await register(base, "invitee1", "1234");
+    const outsider = await register(base, "outsider1", "1234");
+
+    const created = await (
+      await fetch(`${base}/chambers`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${owner.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ name: "Inner Circle" }),
+      })
+    ).json();
+
+    // The owner is already a member (chamber creation auto-joins them) —
+    // isMember/memberCount should reflect that from the first listing.
+    const ownerChambers = await (
+      await fetch(`${base}/chambers`, { headers: { authorization: `Bearer ${owner.token}` } })
+    ).json();
+    assert.equal(ownerChambers.length, 1);
+    assert.equal(ownerChambers[0].memberCount, 1);
+    assert.equal(ownerChambers[0].isMember, true);
+
+    // An outsider can't even confirm the chamber exists.
+    const outsiderSeesMembers = await fetch(`${base}/chambers/${created.id}/members`, {
+      headers: { authorization: `Bearer ${outsider.token}` },
+    });
+    assert.equal(outsiderSeesMembers.status, 404);
+
+    const invite = await fetch(`${base}/chambers/${created.id}/members`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${owner.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ handle: "invitee1" }),
+    });
+    assert.equal(invite.status, 201);
+
+    // Re-inviting the same person is rejected, not silently duplicated.
+    const reinvite = await fetch(`${base}/chambers/${created.id}/members`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${owner.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ handle: "invitee1" }),
+    });
+    assert.equal(reinvite.status, 409);
+
+    // An outsider still can't invite themselves in.
+    const selfInvite = await fetch(`${base}/chambers/${created.id}/members`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${outsider.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ handle: "outsider1" }),
+    });
+    assert.equal(selfInvite.status, 404);
+
+    // Now that invitee1 is a member, they can see the member list too --
+    // this is what lets a client fan a message out to everyone's keys.
+    const members = await (
+      await fetch(`${base}/chambers/${created.id}/members`, {
+        headers: { authorization: `Bearer ${invitee.token}` },
+      })
+    ).json();
+    const handles = members.map((m) => m.handle).sort();
+    assert.deepEqual(handles, ["invitee1", "owner1"]);
+    assert.ok(members.every((m) => typeof m.pubkey === "string" && m.pubkey.length > 0));
+  });
+});
+
+test("the careers list is static reference data, no auth required", async (t) => {
+  await withServer(t, async (base) => {
+    const res = await fetch(`${base}/chambers/careers`);
+    assert.equal(res.status, 200);
+    const careers = await res.json();
+    assert.ok(Array.isArray(careers));
+    assert.ok(careers.includes("Technology"));
+  });
+});

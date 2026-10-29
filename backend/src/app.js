@@ -195,16 +195,42 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
 
   // --- Chambers -------------------------------------------------------
 
+  // A fixed reference list, not a DB table -- "career" here means a
+  // membership category a chamber can be tagged with when created (the
+  // invite-only-society framing this project started from), not a job
+  // board. No auth required: it's static reference data, same shape as
+  // the CLI's existing cmd_careers call, which sends no bearer token.
+  const CHAMBER_CAREERS = [
+    "Finance",
+    "Technology",
+    "Law",
+    "Medicine",
+    "Academia",
+    "Arts",
+    "Government",
+    "Entrepreneurship",
+  ];
+  app.get("/chambers/careers", (req, res) => {
+    return res.json(CHAMBER_CAREERS);
+  });
+
   app.get("/chambers", requireAuth, (req, res) => {
     const rows = db
       .prepare(
-        `SELECT c.id, c.name, c.created_at as createdAt
+        `SELECT c.id, c.name, c.created_at as createdAt,
+                (SELECT COUNT(*) FROM chamber_members m2 WHERE m2.chamber_id = c.id) as memberCount
          FROM chambers c
          JOIN chamber_members m ON m.chamber_id = c.id
          WHERE m.user_id = ?`,
       )
       .all(req.user.id);
-    return res.json(rows);
+    // Every row here is, by construction (the JOIN above restricts to
+    // chambers req.user.id belongs to), one req.user is a member of --
+    // isMember is always true on THIS endpoint. Returned explicitly
+    // anyway because the CLI's ChamberRow (cli/src/main.rs) already
+    // expects the field, and a future "browse chambers you haven't
+    // joined" listing would need the same field to actually vary.
+    return res.json(rows.map((r) => ({ ...r, isMember: true })));
   });
 
   app.post("/chambers", requireAuth, (req, res) => {
@@ -225,6 +251,67 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
       insertMember.run(id, req.user.id);
     })();
     return res.status(201).json({ id, name, createdAt });
+  });
+
+  function requireChamberMember(req, res) {
+    const chamber = db.prepare("SELECT * FROM chambers WHERE id = ?").get(req.params.id);
+    if (!chamber) {
+      res.status(404).json({ error: "no such chamber" });
+      return null;
+    }
+    const isMember = db
+      .prepare("SELECT 1 FROM chamber_members WHERE chamber_id = ? AND user_id = ?")
+      .get(chamber.id, req.user.id);
+    if (!isMember) {
+      // 404, not 403: an invite-only chamber's existence shouldn't be
+      // confirmable to someone who isn't in it by the error shape they
+      // get back -- the same reasoning as the dummy-bcrypt-hash timing
+      // fix on login, applied to membership instead of password timing.
+      res.status(404).json({ error: "no such chamber" });
+      return null;
+    }
+    return chamber;
+  }
+
+  // Invite-only by design, same as the rest of this project's framing:
+  // only an existing member can add another one (there's no public
+  // "join" for a chamber you weren't invited into).
+  app.post("/chambers/:id/members", requireAuth, (req, res) => {
+    const chamber = requireChamberMember(req, res);
+    if (!chamber) return;
+    const { handle } = req.body || {};
+    if (typeof handle !== "string" || handle.length === 0) {
+      return res.status(400).json({ error: "handle is required" });
+    }
+    const target = authUser(req, handle);
+    if (!target) return res.status(404).json({ error: "no such user" });
+    const already = db
+      .prepare("SELECT 1 FROM chamber_members WHERE chamber_id = ? AND user_id = ?")
+      .get(chamber.id, target.id);
+    if (already) return res.status(409).json({ error: "already a member" });
+    db.prepare("INSERT INTO chamber_members (chamber_id, user_id) VALUES (?, ?)").run(
+      chamber.id,
+      target.id,
+    );
+    return res.status(201).json({ added: handle });
+  });
+
+  // What makes real chamber fan-out possible client-side: every member's
+  // identity public keys, so a sender can seal one copy of a message per
+  // member instead of only ever DM-ing one recipient at a time (the gap
+  // this route and the client-side changes alongside it close).
+  app.get("/chambers/:id/members", requireAuth, (req, res) => {
+    const chamber = requireChamberMember(req, res);
+    if (!chamber) return;
+    const rows = db
+      .prepare(
+        `SELECT u.id, u.handle, u.pubkey, u.pq_pubkey as pqPubkey
+         FROM chamber_members m
+         JOIN users u ON u.id = m.user_id
+         WHERE m.chamber_id = ?`,
+      )
+      .all(chamber.id);
+    return res.json(rows);
   });
 
   // --- Messages ---------------------------------------------------------
