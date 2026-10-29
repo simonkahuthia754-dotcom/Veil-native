@@ -29,7 +29,7 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use ml_kem::{
     kem::{Decapsulate, Encapsulate, Kem},
-    Ciphertext as MlKemCiphertext, KeyExport, KeyInit, MlKem768, TryKeyInit,
+    Ciphertext as MlKemCiphertext, KeyExport, KeyInit as MlKemKeyInit, MlKem768, TryKeyInit,
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
