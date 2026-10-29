@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Veil</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Veil</h1>
+    <p id="whoami" class="muted">not logged in</p>
+  </header>
+
+  <!-- Honesty banner: this page is read first so no one mistakes this
+       for a full client. Messaging's real end-to-end encryption (X25519
+       + ML-KEM-768 hybrid, plus the forward-secret ratchet in
+       crypto/src/session.rs) lives in the Rust CLI and, once ported, the
+       Android app -- this UI deliberately does not reimplement that
+       crypto a third time in the browser without the same verification
+       discipline the other two clients went through. What it DOES do
+       for real: account creation/login against the real backend,
+       chamber browsing/creation, and prekey-bundle status -- all genuine
+       REST calls, nothing mocked. -->
+  <div class="banner">
+    This web UI handles accounts and chambers for real. Reading and sending
+    end-to-end-encrypted messages currently requires the CLI (or, once
+    ported, the Android app) — shown here only as a waiting-count, not
+    decrypted in the browser. See the note in <code>frontend/README.md</code>.
+  </div>
+
+  <main id="app">
+    <section id="auth-view">
+      <div class="card">
+        <h2>Register</h2>
+        <form id="register-form">
+          <input name="handle" placeholder="handle" autocomplete="username" required />
+          <input name="pin" type="password" placeholder="PIN (4-8 digits)" inputmode="numeric" pattern="[0-9]{4,8}" autocomplete="new-password" required />
+          <button type="submit">Create account</button>
+        </form>
+      </div>
+      <div class="card">
+        <h2>Log in</h2>
+        <form id="login-form">
+          <input name="handle" placeholder="handle" autocomplete="username" required />
+          <input name="pin" type="password" placeholder="PIN" inputmode="numeric" autocomplete="current-password" required />
+          <button type="submit">Log in</button>
+        </form>
+      </div>
+    </section>
+
+    <section id="main-view" hidden>
+      <div class="card">
+        <h2>Chambers</h2>
+        <form id="create-chamber-form">
+          <input name="name" placeholder="new chamber name" required />
+          <button type="submit">Create</button>
+        </form>
+        <ul id="chamber-list"></ul>
+        <button id="refresh-chambers">Refresh</button>
+      </div>
+
+      <div class="card">
+        <h2>Messages</h2>
+        <p id="inbox-status" class="muted">—</p>
+        <button id="refresh-inbox">Check inbox</button>
+      </div>
+
+      <div class="card">
+        <h2>Account</h2>
+        <button id="logout">Log out</button>
+      </div>
+    </section>
+
+    <p id="error" class="error" hidden></p>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

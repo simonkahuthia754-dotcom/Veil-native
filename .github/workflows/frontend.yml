@@ -1,0 +1,45 @@
+name: frontend
+
+on:
+  push:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend.yml"
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend.yml"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # No build step (plain HTML/CSS/JS, no bundler) — real checks this
+      # CI run can still do: the script actually parses as valid
+      # JavaScript, and a couple of the DOM hooks app.js relies on really
+      # exist in index.html, so a renamed element id doesn't silently
+      # break the page.
+      - name: Syntax-check app.js
+        run: node --check frontend/app.js
+      - name: Cross-check DOM ids referenced in app.js exist in index.html
+        run: |
+          node -e '
+            const fs = require("fs");
+            const js = fs.readFileSync("frontend/app.js", "utf8");
+            const html = fs.readFileSync("frontend/index.html", "utf8");
+            const ids = new Set();
+            for (const m of js.matchAll(/\$\("#([a-zA-Z0-9-]+)"\)/g)) ids.add(m[1]);
+            let missing = [];
+            for (const id of ids) {
+              if (!html.includes(`id="${id}"`)) missing.push(id);
+            }
+            if (missing.length) {
+              console.error("app.js references DOM ids missing from index.html:", missing);
+              process.exit(1);
+            }
+            console.log(`checked ${ids.size} DOM id references, all present.`);
+          '
