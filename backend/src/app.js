@@ -10,6 +10,7 @@ const express = require("express");
 const bcrypt = require("bcryptjs");
 const { openDb, newId, newToken } = require("./db");
 const maze = require("./maze");
+const { securityHeaders, corsAllowlist } = require("./security");
 
 const PIN_PATTERN = /^[0-9]{4,8}$/;
 const BCRYPT_COST = 12;
@@ -56,7 +57,27 @@ function makeLoginLimiter({ maxAttempts = 8, windowMs = 15 * 60 * 1000 } = {}) {
 
 function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new maze.ThreatTracker() } = {}) {
   const app = express();
-  app.use(express.json());
+  // Trusts exactly one hop of X-Forwarded-For -- correct when this
+  // process sits behind exactly one reverse proxy/load balancer doing
+  // TLS termination (the normal real-world deployment shape), and it's
+  // what makes req.ip reflect the real client instead of the proxy's own
+  // address. Both the login rate limiter and the Maze's per-IP threat
+  // tracker depend on req.ip being the real client, not the proxy, so
+  // this isn't cosmetic. If this is ever deployed with more than one
+  // hop of trusted proxy in front of it, this number needs to change to
+  // match -- left as plain `1` rather than `true` (which would trust
+  // every hop, including ones an attacker could forge) since that
+  // distinction matters here.
+  app.set("trust proxy", 1);
+  app.use(securityHeaders);
+  app.use(corsAllowlist());
+  // 256kb comfortably covers a real request here (even a full prekey
+  // bundle: a medium-term key plus ten one-time keys, each ~1.6KB of
+  // base64-encoded X25519+ML-KEM-768 material, is well under 20KB) while
+  // still capping how much an attacker can make this process parse as
+  // JSON per request -- a real, scoped size limit, not "whatever fits in
+  // memory" (express.json()'s own default).
+  app.use(express.json({ limit: "256kb" }));
 
   // The Maze (see maze.js): scores every request for decoy-path hits and
   // attack-shaped payloads, right after body parsing so req.body is
