@@ -29,6 +29,12 @@ android {
     }
     buildFeatures {
         compose = true
+        // Needed for BuildConfig.DEBUG, which MainActivity uses to skip
+        // FLAG_SECURE only in debug builds (so Android Studio's layout
+        // inspector still works locally) while always setting it in
+        // release builds. AGP 8+ no longer generates BuildConfig by
+        // default, so this has to be explicit.
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.14"
