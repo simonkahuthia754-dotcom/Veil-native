@@ -210,6 +210,10 @@ function fakeUuid(rand) {
   ].join("-");
 }
 
+// Fixed reference point for fake "createdAt" timestamps — see the comment
+// in fakeChamber() on why this can't be Date.now().
+const MAZE_TIME_ANCHOR_MS = Date.UTC(2026, 0, 1);
+
 const FAKE_NAMES = [
   "Obsidian",
   "Marrow",
@@ -233,7 +237,15 @@ function fakeChamber(rand) {
     name,
     memberCount: 3 + Math.floor(rand() * 40),
     isMember: rand() > 0.5,
-    createdAt: new Date(Date.now() - Math.floor(rand() * 1e10)).toISOString(),
+    // A fixed anchor, NOT Date.now() — this whole function has to be a
+    // pure function of `rand` (which is itself seeded only from the
+    // client key + path) for the "same request always gets the same
+    // fake answer" property to actually hold. Using the real current
+    // time here would make two requests milliseconds apart return
+    // different createdAt values for what's supposed to be identical
+    // fake data — a real bug caught by this module's own
+    // determinism test, not a hypothetical one.
+    createdAt: new Date(MAZE_TIME_ANCHOR_MS - Math.floor(rand() * 1e10)).toISOString(),
   };
 }
 
