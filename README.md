@@ -86,16 +86,26 @@ used to be critical gaps are now closed — marked `[CLOSED]` rather than
 deleted, so the history of what was fixed and when stays visible.
 
 **Critical — blocks real use today:**
-- **The Android client has not been ported to the forward-secret
-  X3DH + ratchet scheme yet.** It still uses the older static
-  X25519+ML-KEM-768 hybrid seal (`e2e.rs`'s/`E2e.kt`'s scheme) — real
-  encryption, wire-format-compatible with the CLI's fallback path, but
-  with no forward secrecy: a compromised long-term key decrypts all past
-  captured ciphertext for Android-to-Android or Android-to-CLI traffic.
-  The CLI auto-detects this per-contact and falls back to the static
-  scheme with an explicit on-screen note when talking to a contact who
-  hasn't published prekeys (which Android currently never does). Porting
-  the ratchet to Kotlin/BouncyCastle is the next concrete milestone.
+- **Half-closed: the X3DH + ratchet crypto core is now ported to Android
+  (`android/app/src/main/java/com/veil/app/crypto/Session.kt`), but
+  nothing in `VeilSession.kt` calls it yet.** `Session.kt` is a
+  field-for-field, construction-for-construction port of
+  `crypto/src/session.rs` — same HKDF salts/info strings, same DH1-4 +
+  KEM root-key derivation, same per-direction sending-chain ratchet, same
+  skip-ahead/replay/forward-secrecy behavior — verified by a Kotlin test
+  suite (`SessionTest.kt`) that mirrors `session.rs`'s own tests line for
+  line (handshake agreement with/without a one-time prekey, both
+  directions, replay rejection, out-of-order delivery within the skip
+  window, forward secrecy after a chain advance, refusing an
+  unreasonable skip, and JSON round-trips for `Session`/`InitialMessage`/
+  `RatchetedMessage`). What's still genuinely open: `VeilSession.kt`'s
+  `send()`/`loadInbox()` still only call the static `VeilIdentity.seal()`/
+  `open()` scheme — nothing publishes this device's own prekey bundle to
+  `POST /prekeys`, fetches a contact's bundle from `GET
+  /prekeys/:handle/bundle`, or chooses the ratchet path over the static
+  fallback the way the CLI's `seal_for_one` already does. That network
+  wiring — plus storing `Session`/`Prekey` state in `SecureStore`'s vault
+  — is the real next step, not a detail being glossed over.
 - The web frontend (`frontend/`) does not implement E2E encryption at
   all — by design, not by oversight; see `frontend/README.md`. Accounts
   created there get a placeholder identity key and can administer

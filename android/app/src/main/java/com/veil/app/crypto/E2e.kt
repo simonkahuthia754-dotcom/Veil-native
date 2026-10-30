@@ -68,6 +68,19 @@ class VeilIdentity private constructor(
     private val kemPrivate: MLKEMPrivateKeyParameters,
     val kemPublic: MLKEMPublicKeyParameters,
 ) {
+    /**
+     * Package-internal X25519 DH, exposed only to this package (used by
+     * `Session.kt`'s X3DH handshake, the Kotlin twin of `session.rs`) —
+     * never part of the public API, since handing out raw DH output is
+     * exactly the kind of footgun a static-key scheme's `seal`/`open`
+     * methods are deliberately designed to not need from callers.
+     */
+    internal fun diffieHellman(peerXPublic: X25519PublicKeyParameters): ByteArray {
+        val out = ByteArray(X25519PrivateKeyParameters.SECRET_SIZE)
+        xSecret.generateSecret(peerXPublic, out, 0)
+        return out
+    }
+
     /** X25519 public key, base64 — publish this (and [pqPublicKeyBase64]) to the server / contacts. */
     fun publicKeyBase64(): String = b64(xPublic.encoded)
 
