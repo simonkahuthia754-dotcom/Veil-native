@@ -102,13 +102,21 @@ deleted, so the history of what was fixed and when stays visible.
   chambers but can never receive a real end-to-end-encrypted message.
   Porting ML-KEM-768 into browser JS (no native Web Crypto support for
   it) is real, unscoped future work.
-- `VeilSession.unlock()` on Android (`android/app/src/main/java/com/veil/app/state/VeilSession.kt`)
-  currently **always returns `Unlocked`** — `AppLock` state (hash + salt)
-  is never persisted or reloaded between app launches, so there is no
-  real passphrase check yet on Android. Clearly marked `TODO` in the
-  code. `[CLI side CLOSED]`: the CLI now actually persists its identity
-  (`Identity::to_secret_bytes`/`from_secret_bytes` in `crypto/src/e2e.rs`)
-  and loads it back on every run instead of regenerating it.
+- `[CLOSED]` ~~`VeilSession.unlock()` always returns `Unlocked`~~ — this
+  line was stale; a repo review this session found `AppLock`
+  state (Argon2id-hashed passphrase + duress code + fail-count/lockout,
+  `android/app/src/main/java/com/veil/app/crypto/AppLock.kt`) is already
+  persisted to `veil.meta` and actually checked on every `unlock()` call,
+  with real exponential-backoff lockout and a real duress-wipe
+  (`enterDuress()` deletes both the vault and meta files). What was
+  genuinely missing — test coverage proving any of that actually works —
+  is now closed too: `AppLockTest.kt` is this class's first test suite
+  (round-trip unlock, wrong-passphrase counting, lockout + expiry, duress
+  detection not polluting the normal fail counter, and JSON persistence
+  round-trips). `[CLI side CLOSED]`: the CLI now actually persists its
+  identity (`Identity::to_secret_bytes`/`from_secret_bytes` in
+  `crypto/src/e2e.rs`) and loads it back on every run instead of
+  regenerating it.
 
 **High:**
 - No certificate pinning (network_security_config.xml uses system trust
@@ -119,9 +127,13 @@ deleted, so the history of what was fixed and when stays visible.
   before any real install.
 - Chamber fan-out isn't implemented on Android or the CLI (`send()` seals
   to one recipient, not every chamber member).
-- Duress-PIN unlock on Android currently just hides the chamber list in
-  memory; it does not wipe or re-key the real vault file the way the
-  design (and `lock.rs`'s `should_wipe` policy) calls for.
+- `[CLOSED]` ~~Duress-PIN unlock on Android currently just hides the
+  chamber list in memory; it does not wipe or re-key the real vault
+  file~~ — also stale: `VeilSession.enterDuress()` deletes the real
+  vault file and the lock metadata file, reverting the app to looking
+  like a fresh, never-configured install, matching `lock.rs`'s
+  `should_wipe` policy on the Rust side. Now covered by
+  `AppLockTest.kt`'s duress tests.
 - The backend's intrusion-deception layer (`backend/src/maze.js`) is
   deception + rate-limiting, not a WAF or DDoS mitigation, and its threat
   tracker is in-memory — resets on restart, doesn't share state across
@@ -190,16 +202,32 @@ code's actual guarantee — this README is the correction.
 
 1. Port the X3DH + ratchet handshake to Android (Kotlin/BouncyCastle),
    matching `crypto/src/session.rs`'s wire format exactly, so Android
-   stops being the forward-secrecy gap.
-2. Persist `AppLock` state on Android (close the "always unlocks" gap).
-3. `FLAG_SECURE`, real duress-wipe wiring, chamber fan-out on both clients.
-4. Root-cause the CodeQL `java-kotlin` autobuild failure.
-5. General security-hardening pass beyond forward secrecy itself
-   (requested, not yet scoped into concrete line items): certificate
-   pinning, prekey rotation policy/automation, rate-limiting parity
-   between `/auth/login` and the newer `/prekeys`/`/messages` routes,
-   and a second pass over the maze's scoring thresholds against
-   realistic traffic once there is any.
+   stops being the forward-secrecy gap. This is now the single largest
+   remaining gap in the project.
+2. Chamber fan-out on Android (`VeilSession.send()` seals to one
+   recipient only; the backend and CLI already support per-member
+   fan-out via `GET /chambers/:id/members`).
+3. Root-cause the CodeQL `java-kotlin` autobuild failure.
+4. Certificate pinning on Android (`network_security_config.xml`
+   currently trusts the system CA store only).
+5. Prekey rotation policy/automation (none exists yet on either client —
+   a published one-time prekey is never replenished, so a contact who
+   sends several messages before you're ever online again will exhaust
+   your prekey pool and fall back to the non-ratcheted static scheme).
+6. A second pass over the maze's scoring thresholds against real
+   traffic, once there is any.
+
+Deliberately **not** on this list, and why: items like a custom OS
+fork, satellite transport, hardware security keys, QKD, a built-in
+cryptocurrency wallet, or formal verification of the ratchet are each
+independently huge (multi-month-to-multi-year) efforts, several with
+real legal/regulatory exposure (a wallet moving money is a money-
+transmission question, not a coding task) or questionable payoff for
+this app's actual threat model (steganographic transport for a project
+that already runs a conventional HTTPS backend doesn't buy much). If
+any of these become real priorities, they deserve their own scoped
+design doc and an explicit decision to take them on — not a silent
+attempt inside a general "fix everything" pass.
 
 ## Running CI yourself
 
