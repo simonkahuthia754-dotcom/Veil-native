@@ -11,6 +11,7 @@ const bcrypt = require("bcryptjs");
 const { openDb, newId, newToken } = require("./db");
 const maze = require("./maze");
 const { securityHeaders, corsAllowlist } = require("./security");
+const { isValidHandle, isSafeChamberName, MAX_CHAMBER_NAME_LEN } = require("./sanitize");
 
 const PIN_PATTERN = /^[0-9]{4,8}$/;
 const BCRYPT_COST = 12;
@@ -128,8 +129,10 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
 
   app.post("/auth/register", (req, res) => {
     const { handle, pin, pubkey, pqPubkey } = req.body || {};
-    if (typeof handle !== "string" || handle.length < 1 || handle.length > 64) {
-      return res.status(400).json({ error: "handle must be 1-64 characters" });
+    if (!isValidHandle(handle)) {
+      return res.status(400).json({
+        error: "handle must be 1-64 characters, letters/digits/underscore/hyphen only",
+      });
     }
     if (typeof pin !== "string" || !PIN_PATTERN.test(pin)) {
       return res.status(400).json({ error: "PIN must be 4-8 digits" });
@@ -235,8 +238,10 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
 
   app.post("/chambers", requireAuth, (req, res) => {
     const { name } = req.body || {};
-    if (typeof name !== "string" || name.length < 1) {
-      return res.status(400).json({ error: "name is required" });
+    if (!isSafeChamberName(name)) {
+      return res.status(400).json({
+        error: `name must be 1-${MAX_CHAMBER_NAME_LEN} printable ASCII characters`,
+      });
     }
     const id = newId();
     const createdAt = new Date().toISOString();
@@ -280,7 +285,7 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
     const chamber = requireChamberMember(req, res);
     if (!chamber) return;
     const { handle } = req.body || {};
-    if (typeof handle !== "string" || handle.length === 0) {
+    if (!isValidHandle(handle)) {
       return res.status(400).json({ error: "handle is required" });
     }
     const target = authUser(req, handle);

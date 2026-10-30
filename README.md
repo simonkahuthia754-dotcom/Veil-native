@@ -165,9 +165,20 @@ deleted, so the history of what was fixed and when stays visible.
 realistically maps to:** a meaningful subset is implemented and reviewable
 here (E2E encryption — now with forward secrecy on the CLI path, still
 absent on Android, both stated plainly above — Argon2id locks, duress
-codes, auto-wipe hooks, metadata stripping on images, anonymous-feed
-poisoning defenses, an intrusion-deception layer, open-source +
-CI-verified builds across four workflows). Several items are
+codes, auto-wipe hooks, input validation/sanitization and a verified
+no-SQL-injection boundary on the backend, an intrusion-deception layer,
+open-source + CI-verified builds across four workflows). Two items that
+were previously (wrongly) listed here as done have been corrected: this
+codebase has never actually implemented EXIF/metadata stripping on
+images or any kind of "anonymous feed" at all, let alone defenses against
+poisoning one — there is no image-attachment or feed/news-ingestion
+feature anywhere in `cli/`, `android/`, or `backend/` to check. That line
+was carried over inaccurately from an earlier description of this
+project rather than verified against the actual code, which is exactly
+the kind of claim this README exists to catch. If an info-feed feature
+(news/weather/market data, etc.) is ever added, its own poisoning
+defenses would need to be designed and verified then, not assumed from
+this old line. Several items are
 architecturally impossible for any app to honestly claim (true anonymity
 against a state-level network adversary without Tor/mixnet always-on,
 "undetectable to all forensics", zero-metadata at the transport layer
