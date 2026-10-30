@@ -110,10 +110,19 @@ deleted, so the history of what was fixed and when stays visible.
   with real exponential-backoff lockout and a real duress-wipe
   (`enterDuress()` deletes both the vault and meta files). What was
   genuinely missing — test coverage proving any of that actually works —
-  is now closed too: `AppLockTest.kt` is this class's first test suite
-  (round-trip unlock, wrong-passphrase counting, lockout + expiry, duress
-  detection not polluting the normal fail counter, and JSON persistence
-  round-trips). `[CLI side CLOSED]`: the CLI now actually persists its
+  is now partly closed: `AppLockTest.kt` is this class's first test suite,
+  verifying the actual bug-prone part (lockout counting/backoff, duress
+  detection not polluting the normal fail counter, JSON persistence
+  round-trips) against a fake hasher. Still an honest gap, not papered
+  over: `Argon2PasswordHasher`, the real production Argon2id
+  implementation (Argon2Kt's native `.so` binding), is NOT exercised by
+  that test or any CI job — Argon2Kt's own README only documents testing
+  it via `connectedAndroidTest` on a device/emulator, and this repo's
+  `android.yml` only runs host-JVM `testDebugUnitTest`, no emulator. So:
+  the decision logic around the hash is now CI-verified; the hash itself
+  is still "intended to work, unverified," same category as the rest of
+  this project's never-compiled-locally code until CI runs it.
+  `[CLI side CLOSED]`: the CLI now actually persists its
   identity (`Identity::to_secret_bytes`/`from_secret_bytes` in
   `crypto/src/e2e.rs`) and loads it back on every run instead of
   regenerating it.

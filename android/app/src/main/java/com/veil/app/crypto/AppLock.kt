@@ -7,20 +7,46 @@ import kotlin.math.min
 import org.json.JSONObject
 
 /**
+ * The actual password-hashing step, pulled out behind an interface so
+ * `AppLock`'s state machine (lockout counting/backoff, duress detection,
+ * JSON persistence) can be unit-tested on the host JVM without touching
+ * Argon2Kt's native `.so` binding — which, per its own README, is only
+ * documented as testable via `connectedAndroidTest` on a real device or
+ * emulator, not this repo's CI (`gradle testDebugUnitTest`, no emulator).
+ * A test that called Argon2Kt directly from `src/test` would fail with
+ * `UnsatisfiedLinkError`, not a real AppLock bug — this split exists so
+ * the policy logic can be verified for real instead of going untested or
+ * (worse) tested in a way that silently never runs its hashing path.
+ */
+interface PasswordHasher {
+    fun hash(secret: String): String
+    fun verify(encoded: String, secret: String): Boolean
+}
+
+/** The real, production implementation — Argon2id via Argon2Kt's native binding. */
+class Argon2PasswordHasher : PasswordHasher {
+    private val argon2 = Argon2Kt()
+
+    override fun hash(secret: String): String {
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        return argon2.hash(
+            mode = Argon2Mode.ARGON2_ID,
+            password = secret.toByteArray(Charsets.UTF_8),
+            salt = salt,
+            tCostInIterations = 3,
+            mCostInKibibyte = 65536, // 64 MiB — OWASP-recommended profile, matches lock.rs
+        ).encodedOutputAsString()
+    }
+
+    override fun verify(encoded: String, secret: String): Boolean =
+        argon2.verify(Argon2Mode.ARGON2_ID, encoded, secret.toByteArray(Charsets.UTF_8))
+}
+
+/**
  * App-lock logic — the Kotlin sibling of veil-crypto's `lock.rs` in the CLI.
  * Kept deliberately parallel so a security reviewer can diff the two and
  * confirm they actually implement the same policy, not two different ones
  * that happen to share a name.
- *
- * Corrected against Argon2Kt's real, confirmed API (looked up the same way
- * as the Rust ml-kem and Android Tink fixes — this file's first version
- * called `rawHashAsByteArray()` and a `parallelism` parameter that were
- * never confirmed to exist, and used a hand-rolled constant-time compare
- * against raw hash bytes). The confirmed API instead returns a
- * self-contained, PHC-style encoded string (`encodedOutputAsString()`,
- * salt included) and provides its own `verify()` — the same shape as the
- * Rust side's `argon2::password_hash` usage in lock.rs, and it means this
- * class never has to roll its own comparison.
  *
  * Pentester note: this class holds derived hashes, not the passphrase
  * itself, once `attempt()` returns. The raw passphrase lives only as long
@@ -35,6 +61,7 @@ class AppLock private constructor(
     private var failCount: Int,
     private var lockedUntilMs: Long,
     private val maxFails: Int,
+    private val hasher: PasswordHasher,
 ) {
     sealed class Verdict {
         object Unlocked : Verdict()
@@ -43,21 +70,18 @@ class AppLock private constructor(
         data class Locked(val retryAfterMs: Long) : Verdict()
     }
 
-    private val argon2 = Argon2Kt()
-
     fun attempt(passphrase: String, nowMs: Long): Verdict {
         if (nowMs < lockedUntilMs) {
             return Verdict.Locked(lockedUntilMs - nowMs)
         }
-        val passBytes = passphrase.toByteArray(Charsets.UTF_8)
         duressEncoded?.let { encoded ->
-            if (argon2.verify(Argon2Mode.ARGON2_ID, encoded, passBytes)) {
+            if (hasher.verify(encoded, passphrase)) {
                 // Correct, but matches the duress code: caller must trigger
                 // the wipe-and-decoy-open flow, never a normal unlock.
                 return Verdict.Duress
             }
         }
-        if (argon2.verify(Argon2Mode.ARGON2_ID, passphraseEncoded, passBytes)) {
+        if (hasher.verify(passphraseEncoded, passphrase)) {
             failCount = 0
             lockedUntilMs = 0L
             return Verdict.Unlocked
@@ -97,15 +121,25 @@ class AppLock private constructor(
     }
 
     companion object {
-        /** Creates a fresh lock, hashing the given passphrase (and optional duress code) now. */
-        fun create(passphrase: String, duressPassphrase: String? = null, maxFails: Int = 10): AppLock {
-            val argon2 = Argon2Kt()
-            val passEncoded = hashEncoded(argon2, passphrase)
-            val duressEncodedStr = duressPassphrase?.let { hashEncoded(argon2, it) }
-            return AppLock(passEncoded, duressEncodedStr, failCount = 0, lockedUntilMs = 0L, maxFails = maxFails)
+        /**
+         * Creates a fresh lock, hashing the given passphrase (and optional
+         * duress code) now. `hasher` defaults to the real Argon2id
+         * implementation; production call sites never pass this argument.
+         * Tests pass a lightweight fake so the lockout/duress state machine
+         * can run on the host JVM (see the `PasswordHasher` doc comment).
+         */
+        fun create(
+            passphrase: String,
+            duressPassphrase: String? = null,
+            maxFails: Int = 10,
+            hasher: PasswordHasher = Argon2PasswordHasher(),
+        ): AppLock {
+            val passEncoded = hasher.hash(passphrase)
+            val duressEncodedStr = duressPassphrase?.let { hasher.hash(it) }
+            return AppLock(passEncoded, duressEncodedStr, failCount = 0, lockedUntilMs = 0L, maxFails = maxFails, hasher = hasher)
         }
 
-        fun fromJson(json: String): AppLock {
+        fun fromJson(json: String, hasher: PasswordHasher = Argon2PasswordHasher()): AppLock {
             val obj = JSONObject(json)
             return AppLock(
                 passphraseEncoded = obj.getString("passphraseEncoded"),
@@ -113,18 +147,8 @@ class AppLock private constructor(
                 failCount = obj.optInt("failCount", 0),
                 lockedUntilMs = obj.optLong("lockedUntilMs", 0L),
                 maxFails = obj.optInt("maxFails", 10),
+                hasher = hasher,
             )
-        }
-
-        private fun hashEncoded(argon2: Argon2Kt, secret: String): String {
-            val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
-            return argon2.hash(
-                mode = Argon2Mode.ARGON2_ID,
-                password = secret.toByteArray(Charsets.UTF_8),
-                salt = salt,
-                tCostInIterations = 3,
-                mCostInKibibyte = 65536, // 64 MiB — matches lock.rs's OWASP-recommended profile
-            ).encodedOutputAsString()
         }
     }
 }
