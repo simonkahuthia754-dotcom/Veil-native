@@ -497,9 +497,11 @@ async fn cmd_send(
         data,
         identity,
         &token,
-        handle,
-        &contact.pubkey,
-        contact.pq_pubkey.as_deref(),
+        &RecipientKeys {
+            handle,
+            pubkey_b64: &contact.pubkey,
+            pq_pubkey_b64: contact.pq_pubkey.as_deref(),
+        },
         &message,
     )
     .await?;
@@ -537,16 +539,27 @@ async fn cmd_send(
 /// or static-scheme fallback) shared by `cmd_send` (one DM) and
 /// `cmd_chamber_send` (one call per chamber member). Returns
 /// (packed ciphertext JSON, nonce b64, used_forward_secrecy).
+/// Bundles one recipient's identity key material — purely to keep
+/// `seal_for_one`'s argument count under clippy's `too_many_arguments`
+/// threshold (7); this was flagged for real by CI, not a guess.
+struct RecipientKeys<'a> {
+    handle: &'a str,
+    pubkey_b64: &'a str,
+    pq_pubkey_b64: Option<&'a str>,
+}
+
 async fn seal_for_one(
     http: &reqwest::Client,
     data: &mut VaultData,
     identity: &Identity,
     token: &str,
-    recipient_handle: &str,
-    recipient_pubkey_b64: &str,
-    recipient_pq_pubkey_b64: Option<&str>,
+    recipient: &RecipientKeys<'_>,
     message: &str,
 ) -> Result<(String, String, bool)> {
+    let recipient_handle = recipient.handle;
+    let recipient_pubkey_b64 = recipient.pubkey_b64;
+    let recipient_pq_pubkey_b64 = recipient.pq_pubkey_b64;
+
     // The session map is keyed by the recipient's long-term X25519
     // identity key (base64), not by handle — see VaultData's doc comment
     // on `sessions` for why.
@@ -676,9 +689,11 @@ async fn cmd_chamber_send(
             data,
             identity,
             &token,
-            &member.handle,
-            &member.pubkey,
-            member.pq_pubkey.as_deref(),
+            &RecipientKeys {
+                handle: &member.handle,
+                pubkey_b64: &member.pubkey,
+                pq_pubkey_b64: member.pq_pubkey.as_deref(),
+            },
             &message,
         )
         .await;
