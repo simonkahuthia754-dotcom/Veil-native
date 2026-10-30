@@ -28,14 +28,19 @@
 const HANDLE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_CHAMBER_NAME_LEN = 80;
 
-// Printable ASCII plus common punctuation/space only. Rejects control
-// characters (including bidi-override and zero-width spoofing
-// characters) and anything outside the Basic Latin block. Deliberately
-// conservative: a chamber name is short-lived display text, not a place
-// that needs full Unicode expressiveness, and "reject anything unusual"
-// is a safer default than trying to enumerate every spoofing trick one
-// at a time.
+// Printable ASCII, minus the handful of characters that matter for HTML
+// injection even though a plain allow-list of printable-ASCII wouldn't
+// otherwise catch them: < > & " ' ` are all ordinary printable ASCII
+// bytes, so a naive \x20-\x7E range check alone does NOT reject
+// "<script>...</script>" — that was a real bug caught by this module's
+// own test suite (a chamber name containing an XSS-shaped payload
+// passed validation under the first version of this pattern). Also
+// rejects control characters (including bidi-override and zero-width
+// spoofing characters) and anything outside the Basic Latin block.
+// Deliberately conservative: a chamber name is short-lived display
+// text, not a place that needs full Unicode or markup expressiveness.
 const SAFE_TEXT_PATTERN = /^[\x20-\x7E]+$/;
+const HTML_METACHARACTERS = /[<>&"'`]/;
 
 function isValidHandle(value) {
   return typeof value === "string" && HANDLE_PATTERN.test(value);
@@ -46,7 +51,8 @@ function isSafeChamberName(value) {
     typeof value === "string" &&
     value.length >= 1 &&
     value.length <= MAX_CHAMBER_NAME_LEN &&
-    SAFE_TEXT_PATTERN.test(value)
+    SAFE_TEXT_PATTERN.test(value) &&
+    !HTML_METACHARACTERS.test(value)
   );
 }
 
