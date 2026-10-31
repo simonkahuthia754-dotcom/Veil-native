@@ -20,13 +20,27 @@ import java.util.concurrent.TimeUnit
  * rather than drifting into two different backends-in-spirit.
  */
 
+/**
+ * Real bug fixed here (never caught before because nothing in this app
+ * called `register()`/`login()` yet — see `VeilSession.kt`): the backend's
+ * `POST /auth/register` (`backend/src/app.js`) requires `{handle, pin,
+ * pubkey, pqPubkey}` and `POST /auth/login` requires `{handle, pin}` — a
+ * 4-8 digit PIN (`PIN_PATTERN`), bcrypt-hashed server-side. This file
+ * previously declared `RegisterRequest` without a `pin` field at all and
+ * `LoginRequest` with a `proof` field that the backend doesn't recognize —
+ * confirmed against the real route handlers, not guessed, and matching
+ * what the Rust CLI already sends correctly (`cmd_register`/`cmd_login` in
+ * `cli/src/main.rs`). Both would have failed every request with a 400 the
+ * moment anything actually called them.
+ */
 data class RegisterRequest(
     val handle: String,
+    val pin: String,
     val pubkey: String,
     val pqPubkey: String? = null,
 )
 
-data class LoginRequest(val handle: String, val proof: String)
+data class LoginRequest(val handle: String, val pin: String)
 
 data class AuthResponse(
     val token: String,
@@ -46,11 +60,48 @@ data class UserPublicKeys(
 data class Chamber(val id: String, val name: String, val createdAt: String? = null)
 data class CreateChamberRequest(val name: String)
 
+/**
+ * Another real, previously-unexercised bug fixed here: `POST /messages`
+ * (`backend/src/app.js`) requires `recipientIds: string[]` (a user-id
+ * fan-out list — one row inserted per id) plus `ciphertext`/`nonce`/
+ * `senderPubkey`. There is no `recipientHandle` field on the backend at
+ * all; this struct's old shape would have failed every send with a 400,
+ * same root cause as the auth-DTO bug above (nothing ever called `send()`
+ * far enough to notice, since `token` was always null with no
+ * register()/login() call anywhere in this app — see `VeilSession.kt`).
+ * `scope`/`scopeId` are accepted but not required server-side (the CLI
+ * sends them; the backend ignores them today) — included for parity,
+ * harmless either way.
+ */
 data class SendMessageRequest(
-    val recipientHandle: String,
+    val recipientIds: List<String>,
     val ciphertext: String,
     val nonce: String,
     val senderPubkey: String,
+    val scope: String = "dm",
+    val scopeId: String? = null,
+)
+
+data class AckMessagesRequest(val ids: List<String>)
+
+/**
+ * Prekey wire types — field-for-field match to `backend/src/app.js`'s
+ * `/prekeys` routes (`xPub`/`kemPub`, not snake_case; confirmed against
+ * the route handlers, same discipline as the auth-DTO fix above) and to
+ * what the CLI already sends/receives for the same endpoints.
+ */
+data class PrekeyDto(val xPub: String, val kemPub: String)
+
+data class PublishPrekeysRequest(
+    val mediumTermPrekey: PrekeyDto,
+    val oneTimePrekeys: List<PrekeyDto>,
+)
+
+data class PrekeyBundleResponse(
+    val identityPubkey: String?,
+    val identityPqPubkey: String?,
+    val mediumTermPrekey: PrekeyDto?,
+    val oneTimePrekey: PrekeyDto?,
 )
 
 data class InboxRow(
@@ -87,6 +138,15 @@ interface VeilApi {
 
     @GET("messages")
     fun inbox(@Header("Authorization") bearer: String): Call<List<InboxRow>>
+
+    @POST("prekeys")
+    fun publishPrekeys(@Header("Authorization") bearer: String, @Body body: PublishPrekeysRequest): Call<Unit>
+
+    @GET("prekeys/{handle}/bundle")
+    fun prekeyBundle(@Header("Authorization") bearer: String, @Path("handle") handle: String): Call<PrekeyBundleResponse>
+
+    @POST("messages/ack")
+    fun ackMessages(@Header("Authorization") bearer: String, @Body body: AckMessagesRequest): Call<Unit>
 }
 
 object ApiClient {

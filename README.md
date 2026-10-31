@@ -86,26 +86,45 @@ used to be critical gaps are now closed — marked `[CLOSED]` rather than
 deleted, so the history of what was fixed and when stays visible.
 
 **Critical — blocks real use today:**
-- **Half-closed: the X3DH + ratchet crypto core is now ported to Android
-  (`android/app/src/main/java/com/veil/app/crypto/Session.kt`), but
-  nothing in `VeilSession.kt` calls it yet.** `Session.kt` is a
-  field-for-field, construction-for-construction port of
-  `crypto/src/session.rs` — same HKDF salts/info strings, same DH1-4 +
-  KEM root-key derivation, same per-direction sending-chain ratchet, same
-  skip-ahead/replay/forward-secrecy behavior — verified by a Kotlin test
-  suite (`SessionTest.kt`) that mirrors `session.rs`'s own tests line for
-  line (handshake agreement with/without a one-time prekey, both
-  directions, replay rejection, out-of-order delivery within the skip
-  window, forward secrecy after a chain advance, refusing an
-  unreasonable skip, and JSON round-trips for `Session`/`InitialMessage`/
-  `RatchetedMessage`). What's still genuinely open: `VeilSession.kt`'s
-  `send()`/`loadInbox()` still only call the static `VeilIdentity.seal()`/
-  `open()` scheme — nothing publishes this device's own prekey bundle to
-  `POST /prekeys`, fetches a contact's bundle from `GET
-  /prekeys/:handle/bundle`, or chooses the ratchet path over the static
-  fallback the way the CLI's `seal_for_one` already does. That network
-  wiring — plus storing `Session`/`Prekey` state in `SecureStore`'s vault
-  — is the real next step, not a detail being glossed over.
+- `[CLOSED]` ~~The X3DH + ratchet crypto core is ported but not wired
+  into `VeilSession.kt`~~ — now wired. `send()`/`loadInbox()` mirror the
+  CLI's `seal_for_one`/`cmd_inbox` exactly: reuse a live ratchet session
+  for a contact if one exists, otherwise fetch their prekey bundle
+  (`GET /prekeys/:handle/bundle`) and start one via `initiateSession`,
+  otherwise fall back to the static hybrid scheme with an explicit
+  on-screen note — never silently. `ensurePrekeysPublished()` publishes
+  this device's own medium-term + one-time prekeys (`POST /prekeys`) the
+  first time it's called. The full vault envelope (identity, medium-term
+  prekey, one-time prekey pool, live sessions, auth token) now persists
+  through `SecureStore`, not just the identity — a restart no longer
+  loses forward-secrecy state or the login session.
+
+  Wiring this surfaced two real, previously-unexercised bugs in
+  `ApiClient.kt`, found by diffing its DTOs against the actual backend
+  route handlers (`backend/src/app.js`) rather than against what they
+  were assumed to be: `RegisterRequest`/`LoginRequest` were missing the
+  backend's required `pin` field entirely (`LoginRequest` sent a `proof`
+  field the backend doesn't recognize at all), and `SendMessageRequest`
+  sent a `recipientHandle` field that doesn't exist on the backend, which
+  actually requires `recipientIds: string[]`. Both would have failed
+  every real request with a 400 — never caught before because nothing in
+  this app ever called `register()`/`login()`/`send()` far enough to
+  notice (see the next gap).
+
+  **What this surfaces as the real remaining blocker, bigger than
+  previously stated here:** no screen in `VeilApp.kt` collects a handle
+  or a backend PIN. `SetupScreen` only calls `createLock()`, which builds
+  the local Argon2-locked vault but never touches the network — so
+  `register()`/`login()` (now correct, and ready to call) are never
+  actually invoked by the running app, `token` stays null forever, and
+  every method that requires it (`listChambers`, `send`, `loadInbox`,
+  `ensurePrekeysPublished`) keeps failing closed. This was previously
+  documented as a narrower note inside `send()`'s own doc comment
+  ("nothing calls register()"); it's really the single biggest gap in
+  the Android client: not "fan-out isn't wired" or "the ratchet doesn't
+  exist," but "no Android install can ever create or log into an
+  account." A registration/login screen is the next concrete milestone,
+  not a detail to backfill later.
 - The web frontend (`frontend/`) does not implement E2E encryption at
   all — by design, not by oversight; see `frontend/README.md`. Accounts
   created there get a placeholder identity key and can administer
@@ -219,10 +238,13 @@ code's actual guarantee — this README is the correction.
 
 ## Next milestone (in priority order)
 
-1. Port the X3DH + ratchet handshake to Android (Kotlin/BouncyCastle),
-   matching `crypto/src/session.rs`'s wire format exactly, so Android
-   stops being the forward-secrecy gap. This is now the single largest
-   remaining gap in the project.
+1. **A registration/login screen in `VeilApp.kt`** that collects a handle
+   and a backend PIN and calls `VeilSession.register()`/`login()` (both
+   now correct and ready — see "Honest gaps"). This is now the single
+   largest remaining gap: without it, no Android install can create or
+   log into a backend account at all, which makes every other network
+   feature — chambers, messaging, the ratchet now wired into `send()`/
+   `loadInbox()` — dead code in the actual running app.
 2. Chamber fan-out on Android (`VeilSession.send()` seals to one
    recipient only; the backend and CLI already support per-member
    fan-out via `GET /chambers/:id/members`).
