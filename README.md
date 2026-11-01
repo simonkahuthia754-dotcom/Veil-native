@@ -111,20 +111,25 @@ deleted, so the history of what was fixed and when stays visible.
   this app ever called `register()`/`login()`/`send()` far enough to
   notice (see the next gap).
 
-  **What this surfaces as the real remaining blocker, bigger than
-  previously stated here:** no screen in `VeilApp.kt` collects a handle
-  or a backend PIN. `SetupScreen` only calls `createLock()`, which builds
-  the local Argon2-locked vault but never touches the network — so
-  `register()`/`login()` (now correct, and ready to call) are never
-  actually invoked by the running app, `token` stays null forever, and
-  every method that requires it (`listChambers`, `send`, `loadInbox`,
-  `ensurePrekeysPublished`) keeps failing closed. This was previously
-  documented as a narrower note inside `send()`'s own doc comment
-  ("nothing calls register()"); it's really the single biggest gap in
-  the Android client: not "fan-out isn't wired" or "the ratchet doesn't
-  exist," but "no Android install can ever create or log into an
-  account." A registration/login screen is the next concrete milestone,
-  not a detail to backfill later.
+- `[CLOSED]` ~~No screen in `VeilApp.kt` collects a handle or a backend
+  PIN~~ — `AccountScreen` now does. It sits between `LockScreen` and
+  `ChambersScreen` in the nav graph (`composable("account")`), shown only
+  when `VeilSession.isLoggedIn()` is false after unlocking the local
+  vault (a fresh account needs it; a returning one whose vault envelope
+  already has a token skips straight to chambers). It toggles between
+  register and login, validates the PIN against the same 4–8 digit shape
+  the backend enforces, and calls the now-correct
+  `VeilSession.register()`/`login()` — which, on success, already chains
+  `ensurePrekeysPublished()` internally, so a brand-new account is
+  immediately reachable for a forward-secret handshake, not just
+  registered. This was the single biggest remaining Android gap: not
+  "fan-out isn't wired" or "the ratchet doesn't exist," but "no Android
+  install could ever create or log into an account at all." Not yet
+  covered by any UI/instrumented test (this scaffold has none — see
+  "Honest gaps" below); verified by `gradle lint`/`testDebugUnitTest`/
+  `assembleDebug` passing in CI, which confirms it compiles and doesn't
+  break anything existing, not that a human has tapped through it on a
+  device.
 - The web frontend (`frontend/`) does not implement E2E encryption at
   all — by design, not by oversight; see `frontend/README.md`. Accounts
   created there get a placeholder identity key and can administer
@@ -282,20 +287,13 @@ code's actual guarantee — this README is the correction.
 
 ## Next milestone (in priority order)
 
-1. **A registration/login screen in `VeilApp.kt`** that collects a handle
-   and a backend PIN and calls `VeilSession.register()`/`login()` (both
-   now correct and ready — see "Honest gaps"). This is now the single
-   largest remaining gap: without it, no Android install can create or
-   log into a backend account at all, which makes every other network
-   feature — chambers, messaging, the ratchet now wired into `send()`/
-   `loadInbox()` — dead code in the actual running app.
-2. Chamber fan-out on Android (`VeilSession.send()` seals to one
+1. Chamber fan-out on Android (`VeilSession.send()` seals to one
    recipient only; the backend and CLI already support per-member
    fan-out via `GET /chambers/:id/members`).
-3. Root-cause the CodeQL `java-kotlin` autobuild failure.
-4. Certificate pinning on Android (`network_security_config.xml`
+2. Root-cause the CodeQL `java-kotlin` autobuild failure.
+3. Certificate pinning on Android (`network_security_config.xml`
    currently trusts the system CA store only).
-5. Prekey rotation policy/automation (none exists yet on either client —
+4. Prekey rotation policy/automation (none exists yet on either client —
    a published one-time prekey is never replenished, so a contact who
    sends several messages before you're ever online again will exhaust
    your prekey pool and fall back to the non-ratcheted static scheme).

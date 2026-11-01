@@ -94,6 +94,17 @@ class VeilSession(private val context: Context) {
 
     fun isLockSet(): Boolean = metaFile.exists()
 
+    /**
+     * Whether this device already has a backend session token — loaded
+     * from the vault envelope on [unlock], or set fresh by [register]/
+     * [login]. Drives whether the UI shows the account screen (collect a
+     * handle + PIN) or goes straight to the chambers list.
+     */
+    fun isLoggedIn(): Boolean = token != null
+
+    /** The locally-remembered handle, if any — for display only (e.g. "Logged in as @handle"). */
+    fun currentHandle(): String? = handle
+
     fun createLock(passphrase: String) {
         val newLock = AppLock.create(passphrase)
         val keySalt = SecureStore.newSalt()

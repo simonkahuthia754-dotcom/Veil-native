@@ -35,7 +35,13 @@ fun VeilApp(session: VeilSession) {
         Surface(color = BG, modifier = Modifier.fillMaxSize()) {
             NavHost(navController = nav, startDestination = if (session.isLockSet()) "lock" else "setup") {
                 composable("setup") { SetupScreen(session) { nav.navigate("lock") { popUpTo("setup") { inclusive = true } } } }
-                composable("lock") { LockScreen(session) { nav.navigate("chambers") { popUpTo("lock") { inclusive = true } } } }
+                composable("lock") {
+                    LockScreen(session) {
+                        val dest = if (session.isLoggedIn()) "chambers" else "account"
+                        nav.navigate(dest) { popUpTo("lock") { inclusive = true } }
+                    }
+                }
+                composable("account") { AccountScreen(session) { nav.navigate("chambers") { popUpTo("account") { inclusive = true } } } }
                 composable("chambers") { ChambersScreen(session, nav) }
                 composable("chat/{chamberId}") { backStackEntry ->
                     val id = backStackEntry.arguments?.getString("chamberId") ?: ""
@@ -130,6 +136,75 @@ private fun LockScreen(session: VeilSession, onUnlocked: () -> Unit) {
             }
         }, modifier = Modifier.fillMaxWidth()) {
             Text("Unlock")
+        }
+    }
+}
+
+/**
+ * The screen this app has never had: collects a handle and a backend PIN
+ * and actually calls [VeilSession.register]/[VeilSession.login] — the
+ * previously-dead code path named as the #1 gap in the README. The local
+ * vault/passphrase (set up on [SetupScreen]/[LockScreen]) is a separate
+ * concept from this backend account: the vault protects this device's
+ * keys at rest; registering/logging in is what lets this device actually
+ * reach other people through the backend at all.
+ *
+ * PIN here means the same 4–8 digit backend PIN the CLI's `cmd_register`/
+ * `cmd_login` already use (`PIN_PATTERN` in `backend/src/app.js`) — not
+ * the vault passphrase from setup, and deliberately not reusing that
+ * passphrase as the PIN (different secrets, different threat models: the
+ * PIN only ever has to resist the backend's own rate limiting, not an
+ * offline brute force against a stolen device).
+ */
+@Composable
+private fun AccountScreen(session: VeilSession, onDone: () -> Unit) {
+    var mode by remember { mutableStateOf(true) } // true = register, false = login
+    var handle by remember { mutableStateOf("") }
+    var pin by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    fun submit() {
+        error = null
+        if (handle.isBlank()) { error = "Enter a handle."; return }
+        if (!pin.matches(Regex("^\\d{4,8}$"))) { error = "PIN must be 4–8 digits."; return }
+        busy = true
+        val onSuccess = { busy = false; onDone() }
+        val onError = { msg: String -> busy = false; error = msg }
+        if (mode) session.register(handle, pin, onSuccess, onError) else session.login(handle, pin, onSuccess, onError)
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(if (mode) "Create your account" else "Log in", color = FG, style = MaterialTheme.typography.headlineSmall)
+        Text(
+            "Your handle is how others find you. The PIN protects this account on the backend — separate from your vault passphrase.",
+            color = MUTED,
+            modifier = Modifier.padding(top = 8.dp, bottom = 24.dp),
+        )
+        OutlinedTextField(
+            value = handle, onValueChange = { handle = it }, label = { Text("Handle") },
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = pin, onValueChange = { if (it.length <= 8) pin = it.filter(Char::isDigit) }, label = { Text("PIN (4–8 digits)") },
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+            enabled = !busy,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        error?.let { Text(it, color = SIGNAL, modifier = Modifier.padding(top = 8.dp)) }
+        Spacer(Modifier.height(20.dp))
+        Button(onClick = { submit() }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            Text(if (busy) "Working…" else if (mode) "Register" else "Log in")
+        }
+        Spacer(Modifier.height(12.dp))
+        TextButton(onClick = { mode = !mode; error = null }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+            Text(if (mode) "Already have an account? Log in" else "Need an account? Register", color = MUTED)
         }
     }
 }
