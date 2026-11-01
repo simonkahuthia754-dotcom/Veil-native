@@ -492,7 +492,7 @@ async fn cmd_send(
     }
     let contact: UserBundle = resp.json().await?;
 
-    let (packed, nonce_b64, used_forward_secrecy) = seal_for_one(
+    let result = seal_for_one(
         http,
         data,
         identity,
@@ -505,16 +505,19 @@ async fn cmd_send(
         &message,
     )
     .await?;
+    let used_forward_secrecy = result.used_forward_secrecy;
 
-    let my_x_pub_b64 = B64.encode(identity.public_bundle().0);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "scope": "dm",
         "scopeId": handle,
         "recipientIds": [contact.id],
-        "ciphertext": packed,
-        "nonce": nonce_b64,
-        "senderPubkey": my_x_pub_b64,
+        "ciphertext": result.packed,
+        "nonce": result.nonce_b64,
     });
+    match result.sender {
+        SenderId::Tag(tag) => body["senderTag"] = serde_json::Value::String(tag),
+        SenderId::Pubkey(pk) => body["senderPubkey"] = serde_json::Value::String(pk),
+    }
     let resp = http
         .post(format!("{}/messages", backend_base()))
         .bearer_auth(&token)
@@ -548,6 +551,24 @@ struct RecipientKeys<'a> {
     pq_pubkey_b64: Option<&'a str>,
 }
 
+/// What identifies the sender to the backend for one sealed message.
+/// Exactly one of these ever travels on the wire per message, never both —
+/// see `Session::tag_b64`'s doc comment for why `Tag` exists at all: it
+/// lets the backend route/store a ratcheted message without ever learning
+/// either party's long-term identity key, something `Pubkey` structurally
+/// cannot do (the static scheme has no session, hence no tag to use).
+enum SenderId {
+    Tag(String),
+    Pubkey(String),
+}
+
+struct SealResult {
+    packed: String,
+    nonce_b64: String,
+    sender: SenderId,
+    used_forward_secrecy: bool,
+}
+
 async fn seal_for_one(
     http: &reqwest::Client,
     data: &mut VaultData,
@@ -555,24 +576,28 @@ async fn seal_for_one(
     token: &str,
     recipient: &RecipientKeys<'_>,
     message: &str,
-) -> Result<(String, String, bool)> {
+) -> Result<SealResult> {
     let recipient_handle = recipient.handle;
     let recipient_pubkey_b64 = recipient.pubkey_b64;
     let recipient_pq_pubkey_b64 = recipient.pq_pubkey_b64;
 
     // The session map is keyed by the recipient's long-term X25519
     // identity key (base64), not by handle — see VaultData's doc comment
-    // on `sessions` for why.
+    // on `sessions` for why. This is purely a LOCAL lookup key for "do I
+    // already have a session with this contact" — it never appears in the
+    // outer envelope sent to the backend once a session exists; the
+    // session's own tag does that job instead (see SenderId::Tag).
     let session_key = recipient_pubkey_b64.to_string();
 
     if let Some(session) = data.sessions.get_mut(&session_key) {
         let msg = session.seal(message.as_bytes())?;
         let nonce_b64 = B64.encode(&msg.nonce);
-        return Ok((
-            serde_json::json!({ "msg": msg }).to_string(),
+        return Ok(SealResult {
+            packed: serde_json::json!({ "msg": msg }).to_string(),
             nonce_b64,
-            true,
-        ));
+            sender: SenderId::Tag(session.tag_b64()),
+            used_forward_secrecy: true,
+        });
     }
 
     let bundle_resp = http
@@ -610,12 +635,20 @@ async fn seal_for_one(
         let (mut session, init) = initiate_session(identity, &prekey_bundle)?;
         let msg = session.seal(message.as_bytes())?;
         let nonce_b64 = B64.encode(&msg.nonce);
+        // The tag is derivable the instant the handshake completes (it
+        // only needs the root key, already computed inside
+        // initiate_session), so even this FIRST message of a session can
+        // use SenderId::Tag — there is no "handshake message must leak
+        // identity" requirement left once InitialMessage already carries
+        // initiator_identity_x_public inside the ciphertext payload itself.
+        let sender = SenderId::Tag(session.tag_b64());
         data.sessions.insert(session_key.clone(), session);
-        return Ok((
-            serde_json::json!({ "init": init, "msg": msg }).to_string(),
+        return Ok(SealResult {
+            packed: serde_json::json!({ "init": init, "msg": msg }).to_string(),
             nonce_b64,
-            true,
-        ));
+            sender,
+            used_forward_secrecy: true,
+        });
     }
 
     let pq_pubkey = recipient_pq_pubkey_b64.ok_or_else(|| {
@@ -634,7 +667,16 @@ async fn seal_for_one(
         "ct": B64.encode(&sealed.ciphertext),
     })
     .to_string();
-    Ok((packed, nonce_b64, false))
+    // The static scheme has no session, hence no tag — this is the one
+    // case where the backend genuinely must see the real identity key to
+    // route the message at all (open() needs it for the DH step too).
+    let my_x_pub_b64 = B64.encode(identity.public_bundle().0);
+    Ok(SealResult {
+        packed,
+        nonce_b64,
+        sender: SenderId::Pubkey(my_x_pub_b64),
+        used_forward_secrecy: false,
+    })
 }
 
 async fn cmd_chamber_send(
@@ -669,7 +711,6 @@ async fn cmd_chamber_send(
     }
     let members: Vec<ChamberMember> = resp.json().await?;
     let my_id = data.user_id.clone();
-    let my_x_pub_b64 = B64.encode(identity.public_bundle().0);
 
     // Sealing is pairwise, so this is genuinely one handshake-or-ratchet
     // step and one POST per member — not one shared ciphertext, which
@@ -697,7 +738,7 @@ async fn cmd_chamber_send(
             &message,
         )
         .await;
-        let (packed, nonce_b64, _used_forward_secrecy) = match result {
+        let result = match result {
             Ok(v) => v,
             Err(e) => {
                 failed.push(member.handle.clone());
@@ -705,14 +746,17 @@ async fn cmd_chamber_send(
                 continue;
             }
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "scope": "chamber",
             "scopeId": chamber_id,
             "recipientIds": [member.id],
-            "ciphertext": packed,
-            "nonce": nonce_b64,
-            "senderPubkey": my_x_pub_b64,
+            "ciphertext": result.packed,
+            "nonce": result.nonce_b64,
         });
+        match result.sender {
+            SenderId::Tag(tag) => body["senderTag"] = serde_json::Value::String(tag),
+            SenderId::Pubkey(pk) => body["senderPubkey"] = serde_json::Value::String(pk),
+        }
         let send_resp = http
             .post(format!("{}/messages", backend_base()))
             .bearer_auth(&token)
@@ -773,12 +817,16 @@ async fn cmd_invite(http: &reqwest::Client, data: &VaultData, args: &[&str]) -> 
 // since better-sqlite3 doesn't transform them), unlike most of this API
 // which is camelCase JSON — a real inconsistency in veil-backend worth
 // normalizing there later. Matched as-is here rather than papered over.
+// `sender_pubkey` and `sender_tag` are both nullable now: exactly one of
+// them is present per row, matching whichever `SenderId` variant
+// `seal_for_one` chose on the sending side (see that enum's doc comment).
 #[derive(Deserialize)]
 struct InboxRow {
     id: String,
     ciphertext: String,
     nonce: String,
-    sender_pubkey: String,
+    sender_pubkey: Option<String>,
+    sender_tag: Option<String>,
 }
 
 async fn cmd_inbox(
@@ -831,10 +879,13 @@ async fn cmd_inbox(
 
         let plaintext: Result<Vec<u8>> = if packed.get("kemCt").is_some() {
             (|| -> Result<Vec<u8>> {
+                let sender_pubkey = row.sender_pubkey.as_ref().ok_or_else(|| {
+                    anyhow!("static-scheme message missing senderPubkey — malformed row")
+                })?;
                 let kem_ct = B64.decode(packed["kemCt"].as_str().unwrap_or_default())?;
                 let ct = B64.decode(packed["ct"].as_str().unwrap_or_default())?;
                 let sealed = SealedMessage {
-                    sender_x_public: B64.decode(&row.sender_pubkey)?,
+                    sender_x_public: B64.decode(sender_pubkey)?,
                     kem_ciphertext: kem_ct,
                     nonce: B64.decode(&row.nonce)?,
                     ciphertext: ct,
@@ -849,17 +900,34 @@ async fn cmd_inbox(
                 let init: veil_crypto::InitialMessage = serde_json::from_value(init_val.clone())?;
                 let msg: veil_crypto::RatchetedMessage =
                     serde_json::from_value(packed["msg"].clone())?;
+                // The sender's identity is inside the (now-decrypted-context)
+                // init payload itself, not the outer row — the outer column
+                // carries the session's opaque tag instead (see SenderId),
+                // never the real identity, for exactly this message type.
+                let session_key = B64.encode(&init.initiator_identity_x_public);
                 let mut session = accept_session(identity, my_mt, &mut my_otpks, &init)?;
                 let plaintext = session.open(&msg)?;
-                data.sessions.insert(row.sender_pubkey.clone(), session);
+                data.sessions.insert(session_key, session);
                 Ok(plaintext)
             })()
         } else if let Some(msg_val) = packed.get("msg") {
             (|| -> Result<Vec<u8>> {
-                let msg: veil_crypto::RatchetedMessage = serde_json::from_value(msg_val.clone())?;
-                let session = data.sessions.get_mut(&row.sender_pubkey).ok_or_else(|| {
-                    anyhow!("no session for this sender yet (their handshake message may have arrived out of order, or wasn't received) — can't decrypt")
+                let tag = row.sender_tag.as_ref().ok_or_else(|| {
+                    anyhow!("ratcheted message missing senderTag — malformed row")
                 })?;
+                let msg: veil_crypto::RatchetedMessage = serde_json::from_value(msg_val.clone())?;
+                // No sender identity on the wire for a continuation message
+                // by design (that's the point of the tag) — find the
+                // matching live session by comparing tags. A linear scan
+                // over this device's own contact list, not a backend-scale
+                // concern: human social graphs, not millions of rows.
+                let session = data
+                    .sessions
+                    .values_mut()
+                    .find(|s| s.tag_b64() == *tag)
+                    .ok_or_else(|| {
+                        anyhow!("no session matches this message's tag (their handshake message may have arrived out of order, or wasn't received) — can't decrypt")
+                    })?;
                 Ok(session.open(&msg)?)
             })()
         } else {

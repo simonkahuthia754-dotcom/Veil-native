@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng as AeadOsRng},
     XChaCha20Poly1305, XNonce,
@@ -213,6 +214,19 @@ pub struct Session {
     recv_counter: u32,
     #[zeroize(skip)]
     skipped_keys: HashMap<u32, [u8; 32]>,
+    /// An opaque, stable per-session identifier — HKDF-derived from the
+    /// root key at handshake time (both sides land on the same value
+    /// independently, the same way the two chain keys are derived), NOT
+    /// transmitted anywhere during the handshake itself. Its purpose: let
+    /// the backend route/store "which session does this ratcheted message
+    /// belong to" WITHOUT ever seeing either party's long-term identity
+    /// key. One-way by construction (HKDF), so observing this tag gives an
+    /// outside party no way to recover the root key, the chain keys, or
+    /// either party's identity — it is only ever useful as an opaque
+    /// bucket label. See `backend/src/app.js`'s `sender_tag` column and
+    /// `cmd_send`/`cmd_inbox` in `cli/src/main.rs` for how it replaces the
+    /// plaintext `sender_pubkey` column for ratcheted traffic.
+    tag: [u8; 32],
 }
 
 /// One ratchet step: HKDF-expand the current chain key (used as the HKDF
@@ -255,6 +269,18 @@ fn derive_chains(root_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     hk.expand(b"chain-responder-to-initiator", &mut responder_to_initiator)
         .expect("32 is a valid HKDF output length");
     (initiator_to_responder, responder_to_initiator)
+}
+
+/// Derives this session's opaque tag (see `Session::tag`'s doc comment) —
+/// a distinct HKDF salt/info from `derive_chains`, so the tag and the
+/// chain keys are cryptographically independent outputs of the same root
+/// key, not reused material.
+fn derive_tag(root_key: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(b"veil-session-tag-v1"), root_key);
+    let mut tag = [0u8; 32];
+    hk.expand(b"tag", &mut tag)
+        .expect("32 is a valid HKDF output length");
+    tag
 }
 
 fn parse_x_public(bytes: &[u8]) -> Result<XPublicKey, SessionError> {
@@ -300,6 +326,7 @@ pub fn initiate(
     }
     let root_key = derive_root_key(&dh_parts, &kem_secret);
     let (chain_i2r, chain_r2i) = derive_chains(&root_key);
+    let tag = derive_tag(&root_key);
 
     let session = Session {
         send_chain_key: chain_i2r,
@@ -307,6 +334,7 @@ pub fn initiate(
         recv_chain_key: chain_r2i,
         recv_counter: 0,
         skipped_keys: HashMap::new(),
+        tag,
     };
     let init_msg = InitialMessage {
         initiator_identity_x_public: my_identity.x_public.as_bytes().to_vec(),
@@ -364,20 +392,34 @@ pub fn accept(
     }
     let root_key = derive_root_key(&dh_parts, &kem_secret);
     let (chain_i2r, chain_r2i) = derive_chains(&root_key);
+    let tag = derive_tag(&root_key);
 
     // Bob is the responder: HIS send chain is responder->initiator, and HIS
     // receive chain is initiator->responder — the mirror image of what
     // `initiate` set up for Alice, from the same two derived chain keys.
+    // `tag` is symmetric by construction (both sides HKDF it from the same
+    // root key with the same salt/info), so Bob's session carries the
+    // identical tag Alice's does without either side transmitting it.
     Ok(Session {
         send_chain_key: chain_r2i,
         send_counter: 0,
         recv_chain_key: chain_i2r,
         recv_counter: 0,
         skipped_keys: HashMap::new(),
+        tag,
     })
 }
 
 impl Session {
+    /// This session's opaque tag, base64 — see the `tag` field's own doc
+    /// comment on `Session` for what it is and isn't. Safe to transmit and
+    /// store in the clear (that's the whole point): a backend operator
+    /// collecting these can tell "these N messages belong to the same
+    /// session" but nothing about who the two parties are.
+    pub fn tag_b64(&self) -> String {
+        B64.encode(self.tag)
+    }
+
     /// Encrypts `plaintext`, advancing the send chain by exactly one step.
     /// The chain key used to derive this message's key is gone the moment
     /// this call returns (overwritten by the next chain key) — that's the
@@ -624,5 +666,55 @@ mod tests {
 
         let m1 = alice_session.seal(b"after restart").unwrap();
         assert_eq!(bob_session.open(&m1).unwrap(), b"after restart");
+    }
+
+    #[test]
+    fn both_sides_independently_derive_the_same_tag() {
+        // The whole point of the tag: it has to agree on both ends without
+        // ever being transmitted during the handshake (the tag field
+        // doesn't exist anywhere in `InitialMessage`).
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let bob_mtpk = Prekey::generate();
+        let mut empty_store = HashMap::new();
+        let bundle = bundle_from(&bob, &bob_mtpk, None);
+        let (alice_session, init_msg) = initiate(&alice, &bundle).unwrap();
+        let bob_session = accept(&bob, &bob_mtpk, &mut empty_store, &init_msg).unwrap();
+
+        assert_eq!(alice_session.tag_b64(), bob_session.tag_b64());
+    }
+
+    #[test]
+    fn two_independent_sessions_get_different_tags() {
+        // Not a cryptographic proof of uniqueness (that's what 256 bits of
+        // HKDF output already gives you) — just a sanity check that this
+        // isn't accidentally a constant or derived from something that
+        // doesn't vary per-handshake (e.g. only the identity keys, which
+        // would make every session between the same two people collide).
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let bob_mtpk = Prekey::generate();
+
+        let bundle1 = bundle_from(&bob, &bob_mtpk, None);
+        let (session1, _) = initiate(&alice, &bundle1).unwrap();
+
+        let bundle2 = bundle_from(&bob, &bob_mtpk, None);
+        let (session2, _) = initiate(&alice, &bundle2).unwrap();
+
+        assert_ne!(session1.tag_b64(), session2.tag_b64());
+    }
+
+    #[test]
+    fn tag_survives_a_serde_round_trip() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let bob_mtpk = Prekey::generate();
+        let bundle = bundle_from(&bob, &bob_mtpk, None);
+        let (alice_session, _) = initiate(&alice, &bundle).unwrap();
+        let original_tag = alice_session.tag_b64();
+
+        let json = serde_json::to_vec(&alice_session).unwrap();
+        let restored: Session = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.tag_b64(), original_tag);
     }
 }

@@ -147,6 +147,62 @@ test("send a message, recipient receives and acks it, then it's gone", async (t)
   });
 });
 
+test("a ratcheted message can use senderTag instead of senderPubkey, and the backend never sees sender_pubkey for it", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alice3", "1234");
+    const bob = await register(base, "bob3", "5678");
+
+    const send = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        scope: "dm",
+        scopeId: "bob3",
+        recipientIds: [bob.id],
+        ciphertext: "cipher-blob",
+        nonce: "nonce-blob",
+        senderTag: "opaque-session-tag",
+      }),
+    });
+    assert.equal(send.status, 201);
+
+    const inbox = await (
+      await fetch(`${base}/messages`, { headers: { authorization: `Bearer ${bob.token}` } })
+    ).json();
+    assert.equal(inbox.length, 1);
+    assert.equal(inbox[0].sender_tag, "opaque-session-tag");
+    assert.equal(inbox[0].sender_pubkey, null); // never populated for a tagged send
+  });
+});
+
+test("sending a message with both senderPubkey and senderTag, or neither, is rejected", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alice4", "1234");
+    const bob = await register(base, "bob4", "5678");
+    const baseBody = {
+      scope: "dm",
+      scopeId: "bob4",
+      recipientIds: [bob.id],
+      ciphertext: "cipher-blob",
+      nonce: "nonce-blob",
+    };
+
+    const neither = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify(baseBody),
+    });
+    assert.equal(neither.status, 400);
+
+    const both = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ ...baseBody, senderPubkey: alice.pubkey, senderTag: "tag" }),
+    });
+    assert.equal(both.status, 400);
+  });
+});
+
 test("prekey bundle: medium-term prekey is reusable, one-time prekeys are consumed exactly once", async (t) => {
   await withServer(t, async (base) => {
     const bob = await register(base, "bob3", "5678");

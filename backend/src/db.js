@@ -43,12 +43,24 @@ function openDb(path) {
       PRIMARY KEY (chamber_id, user_id)
     );
 
+    -- sender_pubkey is nullable now, and sender_tag is new: a ratcheted
+    -- message (continuing session OR its first handshake message -- see
+    -- cli/src/main.rs's seal_for_one/SenderId) carries an opaque,
+    -- HKDF-derived per-session tag instead of the sender's real identity
+    -- key, so this operator never learns who is talking to whom for any
+    -- message past the point a session exists. Only the static,
+    -- non-forward-secret fallback scheme still needs the real
+    -- sender_pubkey (its open() step requires it for the DH). Exactly one
+    -- of the two columns is populated per row -- enforced in app.js's
+    -- POST /messages handler, not at the schema level (SQLite has no
+    -- portable "exactly one of" CHECK worth the complexity here).
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY,
       recipient_id TEXT NOT NULL REFERENCES users(id),
       ciphertext TEXT NOT NULL,
       nonce TEXT NOT NULL,
-      sender_pubkey TEXT NOT NULL,
+      sender_pubkey TEXT,
+      sender_tag TEXT,
       created_at TEXT NOT NULL,
       acked INTEGER NOT NULL DEFAULT 0
     );

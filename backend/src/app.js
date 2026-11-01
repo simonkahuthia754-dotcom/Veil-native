@@ -322,42 +322,76 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
   // --- Messages ---------------------------------------------------------
   // Request shape matches the Rust CLI's real cmd_send (cli/src/main.rs):
   // { scope, scopeId, recipientIds: [userId, ...], ciphertext, nonce,
-  // senderPubkey }. recipientIds is the actual fan-out list — one row is
-  // inserted per recipient, which is what lets this same endpoint serve
-  // both a DM (recipientIds.length === 1) and, later, a whole chamber's
-  // membership without changing the contract.
+  // senderPubkey OR senderTag }. recipientIds is the actual fan-out list
+  // — one row is inserted per recipient, which is what lets this same
+  // endpoint serve both a DM (recipientIds.length === 1) and a whole
+  // chamber's membership without changing the contract.
+  //
+  // senderPubkey vs senderTag: a sender picks exactly one, never both (see
+  // SenderId in cli/src/main.rs). senderPubkey is the sender's real,
+  // long-term identity key — only used by the static, non-forward-secret
+  // fallback scheme, which structurally needs it. senderTag is an opaque,
+  // HKDF-derived per-session identifier that both ends of a ratcheted
+  // conversation land on independently, used for every ratchet message
+  // including a session's first (handshake) message — this operator never
+  // learns who is talking to whom once two clients have exchanged even
+  // one prekey-bundle-based message. Both are treated as inert strings
+  // here; nothing server-side ever inspects or needs to distinguish their
+  // contents beyond "which one did the client send."
+  const MAX_SENDER_FIELD_LEN = 512; // generous: a real value is ~44 chars (base64 of 32 bytes)
 
   app.post("/messages", requireAuth, (req, res) => {
-    const { recipientIds, ciphertext, nonce, senderPubkey } = req.body || {};
+    const { recipientIds, ciphertext, nonce, senderPubkey, senderTag } = req.body || {};
     if (!Array.isArray(recipientIds) || recipientIds.length === 0) {
       return res.status(400).json({ error: "recipientIds must be a non-empty array" });
     }
-    if (typeof ciphertext !== "string" || typeof nonce !== "string" || typeof senderPubkey !== "string") {
-      return res.status(400).json({ error: "ciphertext, nonce and senderPubkey are required" });
+    if (typeof ciphertext !== "string" || typeof nonce !== "string") {
+      return res.status(400).json({ error: "ciphertext and nonce are required" });
     }
+    const hasPubkey = typeof senderPubkey === "string" && senderPubkey.length > 0;
+    const hasTag = typeof senderTag === "string" && senderTag.length > 0;
+    if (hasPubkey === hasTag) {
+      // Covers both "neither" and "both" — exactly one is the contract.
+      return res.status(400).json({ error: "exactly one of senderPubkey or senderTag is required" });
+    }
+    if (
+      (hasPubkey && senderPubkey.length > MAX_SENDER_FIELD_LEN) ||
+      (hasTag && senderTag.length > MAX_SENDER_FIELD_LEN)
+    ) {
+      return res.status(400).json({ error: "senderPubkey/senderTag is unreasonably long" });
+    }
+
     const insert = db.prepare(
-      `INSERT INTO messages (id, recipient_id, ciphertext, nonce, sender_pubkey, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages (id, recipient_id, ciphertext, nonce, sender_pubkey, sender_tag, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
     const createdAt = new Date().toISOString();
     db.transaction(() => {
       for (const recipientId of recipientIds) {
-        insert.run(newId(), recipientId, ciphertext, nonce, senderPubkey, createdAt);
+        insert.run(
+          newId(),
+          recipientId,
+          ciphertext,
+          nonce,
+          hasPubkey ? senderPubkey : null,
+          hasTag ? senderTag : null,
+          createdAt,
+        );
       }
     })();
     return res.status(201).json({ delivered: recipientIds.length });
   });
 
   // Deliberately snake_case (id, ciphertext, nonce, sender_pubkey,
-  // created_at) — both clients already parse this shape as raw SQLite-
-  // style column names (a real inconsistency with the rest of this
-  // camelCase API, documented on both client sides rather than silently
-  // "fixed" here, since fixing it would break two already-working
+  // sender_tag, created_at) — both clients already parse this shape as
+  // raw SQLite-style column names (a real inconsistency with the rest of
+  // this camelCase API, documented on both client sides rather than
+  // silently "fixed" here, since fixing it would break two already-working
   // clients for a cosmetic win).
   app.get("/messages", requireAuth, (req, res) => {
     const rows = db
       .prepare(
-        `SELECT id, ciphertext, nonce, sender_pubkey, created_at
+        `SELECT id, ciphertext, nonce, sender_pubkey, sender_tag, created_at
          FROM messages WHERE recipient_id = ? AND acked = 0
          ORDER BY created_at ASC`,
       )

@@ -189,6 +189,39 @@ deleted, so the history of what was fixed and when stays visible.
   better-sqlite3 + bcryptjs implementation of the contract both clients
   already assumed, CI-tested (`backend/test/`).
 
+**Closed this pass:**
+- `[CLOSED]` The backend used to see every sender's real, long-term
+  identity key in plaintext on every single message (`sender_pubkey`,
+  `NOT NULL`) — including for messages on an already-established
+  forward-secret session, where there was never a cryptographic need for
+  it. Fixed: `Session` (`crypto/src/session.rs`) now derives a second
+  HKDF output alongside its two chain keys — an opaque, 256-bit
+  `tag`, independently computed by both sides from the same root key,
+  never transmitted during the handshake. The CLI's `seal_for_one` now
+  sends `senderTag` instead of `senderPubkey` for every ratcheted
+  message, including a session's first (handshake) message — the
+  responder's identity needs are already met by
+  `InitialMessage.initiator_identity_x_public`, which travels inside the
+  encrypted envelope, not the outer plaintext row. The backend
+  (`messages.sender_tag`, nullable alongside now-nullable
+  `sender_pubkey`) stores and returns whichever one it was sent, and
+  `POST /messages` rejects a request that sends both or neither. Only
+  the static, non-forward-secret fallback scheme still needs the real
+  identity key (its `open()` step requires it for the DH). Net effect:
+  once two contacts have exchanged a single prekey-bundle-based message,
+  the backend operator can tell "these messages belong to the same
+  conversation" from the shared tag, but learns nothing about who the
+  two parties actually are. Verified by new Rust tests
+  (`both_sides_independently_derive_the_same_tag`,
+  `two_independent_sessions_get_different_tags`,
+  `tag_survives_a_serde_round_trip`) and new backend tests
+  (`backend/test/api.test.js`). **Android-side gap, not yet closed:**
+  `Session.kt`'s port doesn't have the tag yet, and `VeilSession.kt`'s
+  `send()`/`loadInbox()` still send/expect `senderPubkey` even once a
+  ratchet session exists — Android messages leak sender identity to the
+  backend today where the CLI's no longer do. Tracked as the next
+  concrete milestone below, not glossed over.
+
 **Medium / known and accepted trade-offs, not bugs:**
 - Vault storage is a single AEAD-encrypted file, not SQLCipher, on both
   clients — a deliberate choice to avoid a C-toolchain cross-compile
@@ -245,17 +278,21 @@ code's actual guarantee — this README is the correction.
    log into a backend account at all, which makes every other network
    feature — chambers, messaging, the ratchet now wired into `send()`/
    `loadInbox()` — dead code in the actual running app.
-2. Chamber fan-out on Android (`VeilSession.send()` seals to one
+2. Port `Session`'s sender-tag (see "Closed this pass") to
+   `Session.kt`/`VeilSession.kt`, so Android messages stop leaking
+   sender identity to the backend once a ratchet session exists — the
+   CLI already does this; Android still sends the real `senderPubkey`.
+3. Chamber fan-out on Android (`VeilSession.send()` seals to one
    recipient only; the backend and CLI already support per-member
    fan-out via `GET /chambers/:id/members`).
-3. Root-cause the CodeQL `java-kotlin` autobuild failure.
-4. Certificate pinning on Android (`network_security_config.xml`
+4. Root-cause the CodeQL `java-kotlin` autobuild failure.
+5. Certificate pinning on Android (`network_security_config.xml`
    currently trusts the system CA store only).
-5. Prekey rotation policy/automation (none exists yet on either client —
+6. Prekey rotation policy/automation (none exists yet on either client —
    a published one-time prekey is never replenished, so a contact who
    sends several messages before you're ever online again will exhaust
    your prekey pool and fall back to the non-ratcheted static scheme).
-6. A second pass over the maze's scoring thresholds against real
+7. A second pass over the maze's scoring thresholds against real
    traffic, once there is any.
 
 Deliberately **not** on this list, and why: items like a custom OS

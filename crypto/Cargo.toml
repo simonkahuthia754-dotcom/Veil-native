@@ -48,5 +48,11 @@ serde_json = "1"
 thiserror = "1"
 hex = "0.4"
 
+# Used only for Session::tag_b64() — encoding the opaque, non-secret
+# per-session metadata tag (see session.rs) for the wire/DB. Same version
+# the CLI crate already depends on and uses identically
+# (`base64::engine::general_purpose::STANDARD` + the `Engine` trait).
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
