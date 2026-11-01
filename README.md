@@ -215,12 +215,23 @@ deleted, so the history of what was fixed and when stays visible.
   (`both_sides_independently_derive_the_same_tag`,
   `two_independent_sessions_get_different_tags`,
   `tag_survives_a_serde_round_trip`) and new backend tests
-  (`backend/test/api.test.js`). **Android-side gap, not yet closed:**
-  `Session.kt`'s port doesn't have the tag yet, and `VeilSession.kt`'s
-  `send()`/`loadInbox()` still send/expect `senderPubkey` even once a
-  ratchet session exists — Android messages leak sender identity to the
-  backend today where the CLI's no longer do. Tracked as the next
-  concrete milestone below, not glossed over.
+  (`backend/test/api.test.js`). Ported to Android in the same pass:
+  `Session.kt` now derives and carries the same `tag`/`tagB64()`
+  (identical salt/info, confirmed bit-for-bit construction parity with
+  `session.rs`), with 3 new mirrored tests
+  (`bothSidesIndependentlyDeriveTheSameTag`,
+  `twoIndependentSessionsGetDifferentTags`, `tagSurvivesAJsonRoundTrip`).
+  `VeilSession.kt`'s `send()` now sends `senderTag` for both the
+  existing-session and new-handshake paths (only the static fallback
+  still sends `senderPubkey`), and `loadInbox()` keys sessions by the
+  handshake's embedded identity key rather than `row.sender_pubkey`
+  (which may now be absent), resolving a continuation message's session
+  by a linear scan matching `row.sender_tag` against each live
+  session's `tagB64()` — same tradeoff the CLI's `cmd_inbox` already
+  documents. `ApiClient.kt`'s `SendMessageRequest`/`InboxRow` DTOs
+  updated to match the backend's now-nullable, exactly-one-of shape.
+  Android messages no longer leak sender identity to the backend once a
+  ratchet session exists, closing the gap flagged above.
 
 **Medium / known and accepted trade-offs, not bugs:**
 - Vault storage is a single AEAD-encrypted file, not SQLCipher, on both
@@ -278,21 +289,17 @@ code's actual guarantee — this README is the correction.
    log into a backend account at all, which makes every other network
    feature — chambers, messaging, the ratchet now wired into `send()`/
    `loadInbox()` — dead code in the actual running app.
-2. Port `Session`'s sender-tag (see "Closed this pass") to
-   `Session.kt`/`VeilSession.kt`, so Android messages stop leaking
-   sender identity to the backend once a ratchet session exists — the
-   CLI already does this; Android still sends the real `senderPubkey`.
-3. Chamber fan-out on Android (`VeilSession.send()` seals to one
+2. Chamber fan-out on Android (`VeilSession.send()` seals to one
    recipient only; the backend and CLI already support per-member
    fan-out via `GET /chambers/:id/members`).
-4. Root-cause the CodeQL `java-kotlin` autobuild failure.
-5. Certificate pinning on Android (`network_security_config.xml`
+3. Root-cause the CodeQL `java-kotlin` autobuild failure.
+4. Certificate pinning on Android (`network_security_config.xml`
    currently trusts the system CA store only).
-6. Prekey rotation policy/automation (none exists yet on either client —
+5. Prekey rotation policy/automation (none exists yet on either client —
    a published one-time prekey is never replenished, so a contact who
    sends several messages before you're ever online again will exhaust
    your prekey pool and fall back to the non-ratcheted static scheme).
-7. A second pass over the maze's scoring thresholds against real
+6. A second pass over the maze's scoring thresholds against real
    traffic, once there is any.
 
 Deliberately **not** on this list, and why: items like a custom OS

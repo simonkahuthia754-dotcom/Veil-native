@@ -187,4 +187,47 @@ class SessionTest {
         val restoredSealed = RatchetedMessage.fromJson(sealed.toJson())
         assertArrayEquals("round trip the envelope too".toByteArray(Charsets.UTF_8), bobSession.open(restoredSealed))
     }
+
+    // The whole point of the tag: it has to agree on both ends without
+    // either side ever transmitting it (see Session.tag's doc comment, and
+    // crypto/src/session.rs's identically-named test).
+    @Test
+    fun bothSidesIndependentlyDeriveTheSameTag() {
+        val alice = VeilIdentity.generate()
+        val bob = VeilIdentity.generate()
+        val bobMtpk = Prekey.generate()
+        val bundle = bundleFrom(bob, bobMtpk, null)
+        val (aliceSession, initMsg) = initiateSession(alice, bundle)
+        val bobSession = acceptSession(bob, bobMtpk, mutableMapOf(), initMsg)
+
+        assertEquals(aliceSession.tagB64(), bobSession.tagB64())
+    }
+
+    @Test
+    fun twoIndependentSessionsGetDifferentTags() {
+        val alice = VeilIdentity.generate()
+        val bob = VeilIdentity.generate()
+        val bobMtpk1 = Prekey.generate()
+        val bundle1 = bundleFrom(bob, bobMtpk1, null)
+        val (session1, _) = initiateSession(alice, bundle1)
+
+        val bobMtpk2 = Prekey.generate()
+        val bundle2 = bundleFrom(bob, bobMtpk2, null)
+        val (session2, _) = initiateSession(alice, bundle2)
+
+        assertTrue(session1.tagB64() != session2.tagB64())
+    }
+
+    @Test
+    fun tagSurvivesAJsonRoundTrip() {
+        val alice = VeilIdentity.generate()
+        val bob = VeilIdentity.generate()
+        val bobMtpk = Prekey.generate()
+        val bundle = bundleFrom(bob, bobMtpk, null)
+        val (aliceSession, _) = initiateSession(alice, bundle)
+
+        val originalTag = aliceSession.tagB64()
+        val restored = Session.fromJson(aliceSession.toJson())
+        assertEquals(originalTag, restored.tagB64())
+    }
 }

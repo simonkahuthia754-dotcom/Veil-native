@@ -184,7 +184,34 @@ class Session internal constructor(
     private var recvChainKey: ByteArray,
     private var recvCounter: Int,
     private val skippedKeys: MutableMap<Int, ByteArray> = mutableMapOf(),
+    /**
+     * An opaque, stable per-session identifier — HKDF-derived from the root
+     * key at handshake time (both sides land on the same value
+     * independently, the same way the two chain keys are derived), NOT
+     * transmitted anywhere during the handshake itself. Mirrors the Rust
+     * CLI's `Session::tag` (see `crypto/src/session.rs`) exactly, so a
+     * session negotiated by one client and later opened by the other (via
+     * the shared backend) lands on the same tag. Its purpose: let the
+     * backend route/store "which session does this ratcheted message
+     * belong to" WITHOUT ever seeing either party's long-term identity key.
+     * One-way by construction (HKDF), so observing this tag gives an
+     * outside party no way to recover the root key, the chain keys, or
+     * either party's identity — it is only ever useful as an opaque bucket
+     * label. See `ApiClient.kt`'s `senderTag` field and
+     * `VeilSession.send()`/`loadInbox()` for how it replaces the plaintext
+     * `senderPubkey` field for ratcheted traffic.
+     */
+    private val tag: ByteArray,
 ) {
+    /**
+     * This session's opaque tag, base64 — see the [tag] field's own doc
+     * comment for what it is and isn't. Safe to transmit and store in the
+     * clear (that's the whole point): a backend operator collecting these
+     * can tell "these N messages belong to the same session" but nothing
+     * about who the two parties are.
+     */
+    fun tagB64(): String = b64(tag)
+
     /** Encrypts [plaintext], advancing the send chain by exactly one step. */
     fun seal(plaintext: ByteArray): RatchetedMessage {
         val (messageKey, nextChainKey) = ratchetStep(sendChainKey)
@@ -246,6 +273,7 @@ class Session internal constructor(
         val skipped = JSONObject()
         skippedKeys.forEach { (counter, key) -> skipped.put(counter.toString(), b64(key)) }
         obj.put("skippedKeys", skipped)
+        obj.put("tag", b64(tag))
         return obj.toString()
     }
 
@@ -261,6 +289,7 @@ class Session internal constructor(
                 recvChainKey = unb64(obj.getString("recvChainKey")),
                 recvCounter = obj.getInt("recvCounter"),
                 skippedKeys = skipped,
+                tag = unb64(obj.getString("tag")),
             )
         }
     }
@@ -327,6 +356,23 @@ private fun deriveChains(rootKey: ByteArray): Pair<ByteArray, ByteArray> {
 }
 
 /**
+ * Derives this session's opaque tag (see [Session]'s `tag` field doc
+ * comment) — a distinct HKDF salt/info from [deriveChains], so the tag and
+ * the chain keys are cryptographically independent outputs of the same
+ * root key, not reused material. Mirrors `derive_tag` in
+ * `crypto/src/session.rs` exactly (same salt `"veil-session-tag-v1"`, same
+ * info `"tag"`), so both sides — and the Rust CLI, if it's a party to the
+ * same session — land on an identical tag.
+ */
+private fun deriveTag(rootKey: ByteArray): ByteArray {
+    val tag = ByteArray(32)
+    val hkdf = HKDFBytesGenerator(SHA256Digest())
+    hkdf.init(HKDFParameters(rootKey, "veil-session-tag-v1".toByteArray(Charsets.UTF_8), "tag".toByteArray(Charsets.UTF_8)))
+    hkdf.generateBytes(tag, 0, 32)
+    return tag
+}
+
+/**
  * Alice's side: start a new session against Bob's fetched prekey bundle.
  * Returns the live [Session] (already has a usable send chain) plus the
  * [InitialMessage] to send as the first real message of the conversation.
@@ -357,8 +403,9 @@ fun initiateSession(myIdentity: VeilIdentity, bundle: PrekeyBundle): Pair<Sessio
     dh4?.let { dhParts.add(it) }
     val rootKey = deriveRootKey(dhParts, kemSecret)
     val (chainI2r, chainR2i) = deriveChains(rootKey)
+    val tag = deriveTag(rootKey)
 
-    val session = Session(sendChainKey = chainI2r, sendCounter = 0, recvChainKey = chainR2i, recvCounter = 0)
+    val session = Session(sendChainKey = chainI2r, sendCounter = 0, recvChainKey = chainR2i, recvCounter = 0, tag = tag)
     val initMsg = InitialMessage(
         initiatorIdentityXPublic = myIdentity.xPublic.encoded,
         initiatorEphemeralXPublic = ephemeralPublic.encoded,
@@ -397,9 +444,13 @@ fun acceptSession(
     dh4?.let { dhParts.add(it) }
     val rootKey = deriveRootKey(dhParts, kemSecret)
     val (chainI2r, chainR2i) = deriveChains(rootKey)
+    val tag = deriveTag(rootKey)
 
     // Bob is the responder: HIS send chain is responder->initiator, and HIS
     // receive chain is initiator->responder — the mirror image of what
     // `initiateSession` set up for Alice, from the same two derived chains.
-    return Session(sendChainKey = chainR2i, sendCounter = 0, recvChainKey = chainI2r, recvCounter = 0)
+    // `tag` is symmetric by construction (both sides HKDF it from the same
+    // root key with the same salt/info), so Bob's session carries the
+    // identical tag Alice's does without either side transmitting it.
+    return Session(sendChainKey = chainR2i, sendCounter = 0, recvChainKey = chainI2r, recvCounter = 0, tag = tag)
 }

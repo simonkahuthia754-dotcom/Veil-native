@@ -419,8 +419,15 @@ class VeilSession(private val context: Context) {
                     val plaintext: ByteArray? = try {
                         when {
                             packed.has("kemCt") -> {
+                                // Static, non-forward-secret fallback: the
+                                // one case that still legitimately needs the
+                                // real sender_pubkey (open() requires it for
+                                // the DH step) — see InboxRow's doc comment.
+                                val senderPubkey = row.sender_pubkey ?: throw IllegalStateException(
+                                    "static-scheme message has no sender_pubkey — malformed row",
+                                )
                                 val sealed = SealedMessage(
-                                    senderXPublic = unb64(row.sender_pubkey),
+                                    senderXPublic = unb64(senderPubkey),
                                     kemCiphertext = unb64(packed.getString("kemCt")),
                                     nonce = unb64(row.nonce),
                                     ciphertext = unb64(packed.getString("ct")),
@@ -435,13 +442,33 @@ class VeilSession(private val context: Context) {
                                 val msg = RatchetedMessage.fromJson(packed.getJSONObject("msg").toString())
                                 val session = acceptSession(id, myMt, oneTimePrekeysAsStringKeyed(), init)
                                 val opened = session.open(msg)
-                                sessions[row.sender_pubkey] = session
+                                // Key by the identity key embedded in the
+                                // decrypted handshake payload, NOT
+                                // row.sender_pubkey — that column may now be
+                                // absent entirely for a handshake message
+                                // (the CLI's cmd_inbox does the same; see
+                                // its `init` branch). The recipient's need
+                                // to know who sent this is already met by
+                                // this field, without the backend ever
+                                // seeing it.
+                                sessions[b64(init.initiatorIdentityXPublic)] = session
                                 sessionsChanged = true
                                 opened
                             }
                             packed.has("msg") -> {
+                                // Continuation of an existing session: the
+                                // row carries the session's opaque tag, not
+                                // an identity key, so resolve it the same
+                                // way cmd_inbox does — a linear scan over
+                                // live sessions for a matching tag. O(n) in
+                                // the contact list is an acceptable
+                                // tradeoff at human scale, not a backend
+                                // concern (see cli/src/main.rs's comment).
+                                val senderTag = row.sender_tag ?: throw IllegalStateException(
+                                    "ratcheted continuation message has no sender_tag — malformed row",
+                                )
                                 val msg = RatchetedMessage.fromJson(packed.getJSONObject("msg").toString())
-                                val session = sessions[row.sender_pubkey] ?: throw IllegalStateException(
+                                val session = sessions.values.find { it.tagB64() == senderTag } ?: throw IllegalStateException(
                                     "no session for this sender yet (their handshake may have arrived out of order, or wasn't received) — can't decrypt",
                                 )
                                 val opened = session.open(msg)
@@ -513,7 +540,7 @@ class VeilSession(private val context: Context) {
                     val msg = existingSession.seal(plaintext.toByteArray(Charsets.UTF_8))
                     persistVault()
                     val packed = JSONObject().put("msg", JSONObject(msg.toJson())).toString()
-                    postMessage(a, t, id, contactId, packed, b64(msg.nonce), onError, onNote)
+                    postMessage(a, t, contactId, packed, b64(msg.nonce), SenderId.Tag(existingSession.tagB64()), onError, onNote)
                     return
                 }
 
@@ -537,7 +564,15 @@ class VeilSession(private val context: Context) {
                                 .put("init", JSONObject(initMsg.toJson()))
                                 .put("msg", JSONObject(msg.toJson()))
                                 .toString()
-                            postMessage(a, t, id, contactId, packed, b64(msg.nonce), onError, onNote)
+                            // Even the FIRST message of a brand-new session
+                            // no longer needs to leak the real identity key:
+                            // the tag is derivable immediately after the
+                            // handshake, and the recipient's identity need
+                            // is already met by initMsg.initiatorIdentityXPublic
+                            // traveling inside the encrypted envelope.
+                            // Mirrors cmd_send's `SenderId::Tag` for the
+                            // new-handshake path in cli/src/main.rs.
+                            postMessage(a, t, contactId, packed, b64(msg.nonce), SenderId.Tag(session.tagB64()), onError, onNote)
                             return
                         }
 
@@ -554,7 +589,10 @@ class VeilSession(private val context: Context) {
                             put("kemCt", b64(sealed.kemCiphertext))
                             put("ct", b64(sealed.ciphertext))
                         }.toString()
-                        postMessage(a, t, id, contactId, packed, b64(sealed.nonce), onError, onNote)
+                        // The one case that still legitimately needs the
+                        // real identity key: open() on the receiving end
+                        // requires it for the DH step (see SealedMessage).
+                        postMessage(a, t, contactId, packed, b64(sealed.nonce), SenderId.Pubkey(id.publicKeyBase64()), onError, onNote)
                     }
                     override fun onFailure(call2: Call<PrekeyBundleResponse>, th: Throwable) {
                         onError(th.message ?: "Network error")
@@ -567,25 +605,42 @@ class VeilSession(private val context: Context) {
         })
     }
 
+    /**
+     * Mirrors the CLI's `SenderId` enum (`cli/src/main.rs`): what goes in
+     * `POST /messages`' sender field is either an opaque per-session [Tag]
+     * (for any ratcheted message — continuation or handshake) or, only for
+     * the static fallback scheme, the real identity [Pubkey].
+     */
+    private sealed class SenderId {
+        data class Tag(val value: String) : SenderId()
+        data class Pubkey(val value: String) : SenderId()
+    }
+
     private fun postMessage(
         a: VeilApi,
         t: String,
-        id: VeilIdentity,
         recipientId: String,
         packedCiphertext: String,
         nonceB64: String,
+        sender: SenderId,
         onError: (String) -> Unit,
         onNote: (String) -> Unit,
     ) {
-        a.sendMessage(
-            "Bearer $t",
-            SendMessageRequest(
+        val request = when (sender) {
+            is SenderId.Tag -> SendMessageRequest(
                 recipientIds = listOf(recipientId),
                 ciphertext = packedCiphertext,
                 nonce = nonceB64,
-                senderPubkey = id.publicKeyBase64(),
-            ),
-        ).enqueue(object : Callback<Unit> {
+                senderTag = sender.value,
+            )
+            is SenderId.Pubkey -> SendMessageRequest(
+                recipientIds = listOf(recipientId),
+                ciphertext = packedCiphertext,
+                nonce = nonceB64,
+                senderPubkey = sender.value,
+            )
+        }
+        a.sendMessage("Bearer $t", request).enqueue(object : Callback<Unit> {
             override fun onResponse(call: Call<Unit>, response: Response<Unit>) {
                 if (!response.isSuccessful) onError("Send failed: ${response.code()}")
             }

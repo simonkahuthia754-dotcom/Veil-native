@@ -64,20 +64,33 @@ data class CreateChamberRequest(val name: String)
  * Another real, previously-unexercised bug fixed here: `POST /messages`
  * (`backend/src/app.js`) requires `recipientIds: string[]` (a user-id
  * fan-out list — one row inserted per id) plus `ciphertext`/`nonce`/
- * `senderPubkey`. There is no `recipientHandle` field on the backend at
- * all; this struct's old shape would have failed every send with a 400,
- * same root cause as the auth-DTO bug above (nothing ever called `send()`
- * far enough to notice, since `token` was always null with no
- * register()/login() call anywhere in this app — see `VeilSession.kt`).
- * `scope`/`scopeId` are accepted but not required server-side (the CLI
- * sends them; the backend ignores them today) — included for parity,
- * harmless either way.
+ * exactly one of `senderPubkey`/`senderTag`. There is no `recipientHandle`
+ * field on the backend at all; this struct's old shape would have failed
+ * every send with a 400, same root cause as the auth-DTO bug above
+ * (nothing ever called `send()` far enough to notice, since `token` was
+ * always null with no register()/login() call anywhere in this app — see
+ * `VeilSession.kt`). `scope`/`scopeId` are accepted but not required
+ * server-side (the CLI sends them; the backend ignores them today) —
+ * included for parity, harmless either way.
+ *
+ * `senderPubkey`/`senderTag` are both nullable and exactly one must be set
+ * per send — mirrors the CLI's `SenderId::{Pubkey,Tag}` (see
+ * `cli/src/main.rs`'s `seal_for_one`/`cmd_send`) and `VeilSession.kt`'s own
+ * `SenderId` sealed class: a ratcheted message (continuing session OR its
+ * handshake) sends `senderTag`, so the backend never learns the real
+ * identity key for any message past the point a session exists; only the
+ * static, non-forward-secret fallback still needs the real `senderPubkey`.
+ * Gson's default converter (configured below, no `serializeNulls()`) omits
+ * a null field from the request body entirely, which is exactly what the
+ * backend's `typeof senderPubkey === "string"` check wants — not just "the
+ * field happens to be null" but genuinely absent.
  */
 data class SendMessageRequest(
     val recipientIds: List<String>,
     val ciphertext: String,
     val nonce: String,
-    val senderPubkey: String,
+    val senderPubkey: String? = null,
+    val senderTag: String? = null,
     val scope: String = "dm",
     val scopeId: String? = null,
 )
@@ -113,7 +126,13 @@ data class InboxRow(
     // guessing a nicer one and finding out only at runtime.
     val ciphertext: String,
     val nonce: String,
-    val sender_pubkey: String,
+    // Both nullable, and exactly one populated per row, mirroring the
+    // backend's `messages` table (see `backend/src/db.js`): a ratcheted
+    // message now carries sender_tag instead of the real sender_pubkey.
+    // Only the static, non-forward-secret fallback scheme still has a
+    // sender_pubkey.
+    val sender_pubkey: String?,
+    val sender_tag: String?,
     val created_at: String,
 )
 
