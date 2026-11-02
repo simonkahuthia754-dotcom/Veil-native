@@ -14,6 +14,7 @@ import com.veil.app.crypto.acceptSession
 import com.veil.app.crypto.initiateSession
 import com.veil.app.net.AckMessagesRequest
 import com.veil.app.net.ApiClient
+import com.veil.app.net.CertPinning
 import com.veil.app.net.Chamber
 import com.veil.app.net.CreateChamberRequest
 import com.veil.app.net.LoginRequest
@@ -92,6 +93,25 @@ class VeilSession(private val context: Context) {
     private val vaultFile: File get() = File(context.filesDir, "veil.vault")
     private val metaFile: File get() = File(context.filesDir, "veil.meta")
 
+    // TOFU certificate pins (see CertPinning.kt) — plaintext by design
+    // (a public-key hash isn't a secret), kept outside the encrypted vault
+    // so pinning applies to every network call, including the very first
+    // register()/login() before any vault state is relevant.
+    private val pinStore: CertPinning.PinStore get() = CertPinning.PinStore(File(context.filesDir, "veil.pins"))
+
+    /**
+     * Clears the stored certificate pin for the current backend, so the
+     * next connection re-pins instead of failing closed forever — the
+     * deliberate escape hatch for an operator who rotated their backend's
+     * TLS certificate on purpose. Exposed for a future "reset pin" action
+     * in settings; not yet wired into the UI (no settings screen exists
+     * yet at all — same honestly-flagged class of gap as the registration
+     * screen was before this session).
+     */
+    fun resetCertPin() {
+        pinStore.resetPin(CertPinning.hostOf(backendUrl()))
+    }
+
     fun isLockSet(): Boolean = metaFile.exists()
 
     /**
@@ -117,7 +137,7 @@ class VeilSession(private val context: Context) {
         identity = newIdentity
         persistVault()
 
-        api = ApiClient.build(backendUrl())
+        api = ApiClient.build(backendUrl(), pinStore = pinStore)
     }
 
     fun unlock(passphrase: String): AppLock.Verdict {
@@ -159,7 +179,7 @@ class VeilSession(private val context: Context) {
                     sessions.clear()
                     persistVault()
                 }
-                api = ApiClient.build(backendUrl())
+                api = ApiClient.build(backendUrl(), pinStore = pinStore)
                 duress = false
             }
             is AppLock.Verdict.Duress -> {

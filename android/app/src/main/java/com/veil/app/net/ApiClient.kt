@@ -182,8 +182,15 @@ object ApiClient {
      * a local SOCKS5 port exactly like the desktop `tor` daemon does, so
      * this needs no Android-specific protocol work, just pointing OkHttp
      * at it.
+     *
+     * `pinStore`, when supplied, turns on TOFU certificate pinning (see
+     * `CertPinning.kt`) scoped to `baseUrl`'s host — on by default from
+     * `VeilSession`, left `null` only for tests/tooling that don't want a
+     * stateful pin file in play. `null` means exactly what
+     * `network_security_config.xml` already enforces (system-CA-validated
+     * TLS, no pinning) — not a downgrade, just no additional narrowing.
      */
-    fun build(baseUrl: String, socksProxyHostPort: String? = null): VeilApi {
+    fun build(baseUrl: String, socksProxyHostPort: String? = null, pinStore: CertPinning.PinStore? = null): VeilApi {
         val builder = OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
@@ -195,6 +202,12 @@ object ApiClient {
                 java.net.InetSocketAddress(host, portStr.toInt()),
             )
             builder.proxy(proxy)
+        }
+
+        if (pinStore != null) {
+            val host = CertPinning.hostOf(baseUrl)
+            val (sslSocketFactory, trustManager) = CertPinning.buildPinnedSslFactory(host, pinStore)
+            builder.sslSocketFactory(sslSocketFactory, trustManager)
         }
 
         // Minimal request-shape sanity log would belong here in debug

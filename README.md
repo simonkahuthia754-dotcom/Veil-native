@@ -162,9 +162,28 @@ deleted, so the history of what was fixed and when stays visible.
   regenerating it.
 
 **High:**
-- No certificate pinning (network_security_config.xml uses system trust
-  anchors only) — explained in that file's own comments, trade-off is
-  deliberate but still a gap against "zero-trust network."
+- `[CLOSED]` ~~No certificate pinning (network_security_config.xml uses
+  system trust anchors only)~~ — `CertPinning.kt` adds trust-on-first-use
+  (TOFU) pinning, scoped per backend host and layered on top of ordinary
+  system-CA validation, not instead of it. The first successful connection
+  to a self-hosted backend records its certificate's SPKI SHA-256 hash
+  (plaintext pin store, `veil.pins` — a public-key hash isn't a secret);
+  every later connection must match it or the TLS handshake fails closed.
+  Wired into `ApiClient.build()` via a new `pinStore` parameter, on by
+  default from `VeilSession`. Honest, undisguised limitation (the same one
+  SSH's `known_hosts` has): an attacker already positioned before the
+  *first-ever* connection still gets pinned as if legitimate — this closes
+  the much more common case of a MITM introduced later (a rogue CA added
+  mid-lifecycle, a pentester's interception box) against which plain
+  system-CA trust does nothing. `VeilSession.resetCertPin()` is the
+  escape hatch for a deliberate backend cert rotation; not yet reachable
+  from any settings screen (none exists). Self-signed backend certs are
+  still rejected by design — supporting that is separate, unscoped work.
+  Not covered by any CI-run test (this scaffold's test suite is JVM unit
+  tests only, and exercising real TLS handshakes/MITM scenarios needs
+  integration-level infrastructure this repo doesn't have yet) — verified
+  by `gradle lint`/`testDebugUnitTest`/`assembleDebug` passing, which
+  confirms it compiles cleanly, not that it's been attacked and held.
 - `FLAG_SECURE` (blocks screenshots/recents-tray thumbnails of message
   content) is not yet set on `MainActivity` — noted inline, must be added
   before any real install.
@@ -291,13 +310,15 @@ code's actual guarantee — this README is the correction.
    recipient only; the backend and CLI already support per-member
    fan-out via `GET /chambers/:id/members`).
 2. Root-cause the CodeQL `java-kotlin` autobuild failure.
-3. Certificate pinning on Android (`network_security_config.xml`
-   currently trusts the system CA store only).
-4. Prekey rotation policy/automation (none exists yet on either client —
+3. Prekey rotation policy/automation (none exists yet on either client —
    a published one-time prekey is never replenished, so a contact who
    sends several messages before you're ever online again will exhaust
    your prekey pool and fall back to the non-ratcheted static scheme).
-6. A second pass over the maze's scoring thresholds against real
+4. A settings screen — the first real gap `CertPinning.kt`'s
+   `resetCertPin()` surfaces: it exists and works, but nothing in the UI
+   can call it yet, so a deliberate backend cert rotation currently has
+   no in-app recovery path short of clearing app data.
+5. A second pass over the maze's scoring thresholds against real
    traffic, once there is any.
 
 Deliberately **not** on this list, and why: items like a custom OS
