@@ -338,6 +338,67 @@ test("the careers list is static reference data, no auth required", async (t) =>
   });
 });
 
+test("a ratchet-shaped envelope ({msg}) is rejected if it sends senderPubkey instead of senderTag", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alicetask4a", "1234");
+    const bob = await register(base, "bobtask4a", "5678");
+
+    const res = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        recipientIds: [bob.id],
+        ciphertext: JSON.stringify({ msg: { counter: 0, nonce: "n", ciphertext: "c" } }),
+        nonce: "nonce-blob",
+        senderPubkey: alice.pubkey, // wrong field for a ratcheted envelope
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /must send senderTag/);
+  });
+});
+
+test("a static-scheme envelope ({kemCt}) is rejected if it sends senderTag instead of senderPubkey", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alicetask4b", "1234");
+    const bob = await register(base, "bobtask4b", "5678");
+
+    const res = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        recipientIds: [bob.id],
+        ciphertext: JSON.stringify({ kemCt: "kem-ct-blob", ct: "ct-blob" }),
+        nonce: "nonce-blob",
+        senderTag: "opaque-session-tag", // wrong field for the static scheme
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /must send senderPubkey/);
+  });
+});
+
+test("a ratchet-shaped envelope ({init, msg}) correctly sending senderTag is accepted", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alicetask4c", "1234");
+    const bob = await register(base, "bobtask4c", "5678");
+
+    const res = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        recipientIds: [bob.id],
+        ciphertext: JSON.stringify({ init: { foo: "bar" }, msg: { counter: 0, nonce: "n", ciphertext: "c" } }),
+        nonce: "nonce-blob",
+        senderTag: "opaque-session-tag",
+      }),
+    });
+    assert.equal(res.status, 201);
+  });
+});
+
 test("logout revokes the caller's own token, and nobody else's", async (t) => {
   await withServer(t, async (base) => {
     const alice = await register(base, "alicelogout", "1234");

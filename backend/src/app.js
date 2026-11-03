@@ -447,6 +447,39 @@ function createApp(
       return res.status(400).json({ error: "senderPubkey/senderTag is unreasonably long" });
     }
 
+    // Structural enforcement, not just trusting the client's choice: both
+    // clients wrap their encrypted payload in a small, intentionally
+    // CLEARTEXT JSON envelope before it ever reaches `ciphertext` — see
+    // VeilSession.kt's send()/loadInbox() and cli/src/main.rs's
+    // seal_for_one/cmd_inbox. `{kemCt, ct}` means the static,
+    // non-forward-secret scheme (which structurally needs the real
+    // identity key for its DH step); `{msg}` or `{init, msg}` means a
+    // ratcheted message (continuation or handshake), which never needs
+    // it. Reading these top-level keys doesn't decrypt anything — `ct`/
+    // `msg.ciphertext`/etc. stay opaque base64 blobs the server never
+    // touches — it only confirms the client's own envelope shape agrees
+    // with which sender field it sent, instead of taking that on faith.
+    // A ciphertext that isn't this recognizable JSON shape (an older
+    // client, a test fixture, anything hand-built) is left unenforced
+    // here rather than rejected — this tightens an existing contract, it
+    // doesn't invent a new one.
+    let packedShape;
+    try {
+      const packed = JSON.parse(ciphertext);
+      if (packed && typeof packed === "object") {
+        if (typeof packed.kemCt === "string") packedShape = "static";
+        else if (packed.msg && typeof packed.msg === "object") packedShape = "ratchet";
+      }
+    } catch (e) {
+      // Not JSON (or not this shape) — nothing to cross-check.
+    }
+    if (packedShape === "static" && !hasPubkey) {
+      return res.status(400).json({ error: "a static-scheme message (kemCt) must send senderPubkey, not senderTag" });
+    }
+    if (packedShape === "ratchet" && !hasTag) {
+      return res.status(400).json({ error: "a ratcheted message (msg) must send senderTag, not senderPubkey" });
+    }
+
     // Real bug closed here, not a defensive nicety: `messages.recipient_id`
     // has a `REFERENCES users(id)` foreign key, and this db is opened with
     // `PRAGMA foreign_keys = ON` (db.js). Before this check, a
