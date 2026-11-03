@@ -338,21 +338,101 @@ while using a conventional HTTPS backend). Treat any such claim elsewhere
 in this project's history as the aspirational framing it was, not as this
 code's actual guarantee — this README is the correction.
 
+## The 3-city / cross-platform roadmap (proposed 2026-11-02, triaged below)
+
+A large spec landed covering a "3-city" topology (an edge deflood relay in
+front of the backend, the backend itself hardened and made blind to real
+identities, plus a fully offline/local transport), a per-hop Tor circuit
+scheme, four rate-limiting "deflooder" layers, licensing/release hygiene,
+and a cross-platform plan (WASM, UniFFI, Tauri). Triaged honestly rather
+than built blind, since several pieces are independently large and one
+conflicts with this project's own stated goal:
+
+**Already done, verified:**
+- Structural senderTag-vs-senderPubkey enforcement by envelope shape
+  (the spec's "TASK 4") — see "Closed this pass" below.
+
+**Real, scoped, buildable next — folded into the priority list below:**
+- CITY3 (offline/direct transport: QR contact add, file-based message
+  export/import) — genuinely new capability, reuses `session.rs`'s
+  existing envelope with zero new crypto, exactly as proposed.
+- Tor-by-default wiring (CLI warns if `VEIL_SOCKS_PROXY` unset; Android
+  defaults to `127.0.0.1:9050` when Orbot's installed) — straightforward.
+- LICENSE (AGPL-3.0) + `SECURITY.md` + a `v0.1.0` tag — pure hygiene, no
+  design risk, does real good (a disclosure contact, a license that
+  actually protects a self-hosted deployment).
+- Deflooder layers 1 (IP: subnet-level banning, proof-of-work header),
+  3 (per-device token bucket keyed by `identity_x_public`), and 4 (web:
+  Origin/double-submit, endpoint-specific rate limits) — all coherent,
+  all keyed by data the backend already has, none require collecting
+  anything new about a person.
+- The cross-platform plan (WASM build of `veil-crypto` for a real E2E
+  browser frontend; UniFFI bindings so iOS/Mac reuse the Rust ratchet
+  directly instead of a hand-port; a Tauri shell around the existing CLI
+  for a Linux/Mac/Windows desktop GUI) — this independently converges
+  with what was already scoped in this README before the spec arrived.
+  Real, multi-week work; this sandbox also can't fetch the `wasm32`
+  std-lib target or a Swift/Xcode toolchain over its restricted network,
+  so the actual cross-compilation has to happen in an environment with
+  real package-registry access, not here.
+
+**Needs a real design pass before coding, not a quick patch:**
+- CITY1/CITY2 as genuinely separate services with per-hop Tor circuits
+  (CITY1 dialing CITY2 over its own fresh circuit) is, functionally, a
+  small private mix network — a legitimate, real idea, but its own
+  multi-week project with its own failure modes (CITY1 itself becomes a
+  thing that can be seized/subpoenaed/compromised, and now there are two
+  attack surfaces instead of one unless this is designed carefully).
+  Worth doing properly, not worth faking.
+- `recipientTagHash = HMAC(pepper, recipientId)` as proposed doesn't
+  obviously achieve what it's aiming for: the backend still has to
+  resolve "which user is this message for" to store/deliver it, so
+  either it keeps a reverse index from hash to real id (which
+  re-creates exactly the correlation the hash was meant to remove) or
+  the client has to look up its own hash some other way. The honest
+  version of this idea needs a specific design (e.g. the backend
+  storing messages keyed by a value only the recipient's own device can
+  compute, derived the same HKDF way the sealed-sender tag already is)
+  before it's implementable — not implemented here as literally
+  specified, because the literal spec doesn't close the gap it claims
+  to.
+
+**Flagged, not built, pending explicit confirmation:** the phone-number
+deflooder layer (collecting a phone number at registration, even hashed,
+to rate-limit PIN requests and cross-reference VOIP/disposable ranges)
+directly conflicts with this project's own anonymity goal — a phone
+number is one of the most identifying pieces of data a person has, and
+nothing else in Veil's registration flow collects anything like it
+today. Hashing it doesn't change that it has to be *collected* first,
+from every real user, to work at all. This isn't implemented pending an
+explicit decision that this tradeoff is wanted, since it's the kind of
+choice that can't be quietly undone once real users' phone numbers have
+been collected.
+
 ## Next milestone (in priority order)
 
 1. Chamber fan-out on Android (`VeilSession.send()` seals to one
    recipient only; the backend and CLI already support per-member
    fan-out via `GET /chambers/:id/members`).
-2. Root-cause the CodeQL `java-kotlin` autobuild failure.
-3. Prekey rotation policy/automation (none exists yet on either client —
+2. CITY3: offline/direct transport — QR contact add (handle +
+   `identity_x_public` + ML-KEM-768 public, no prekey bundle needed) and
+   file-based export/import of a sealed message, reusing `session.rs`'s
+   existing envelope on both clients.
+3. LICENSE (AGPL-3.0) + `SECURITY.md` + a `v0.1.0` tag.
+4. Tor-by-default wiring (CLI warns if unset; Android defaults to Orbot
+   when installed).
+5. Deflooder layers 1/3/4 (IP subnet banning + proof-of-work, per-device
+   token bucket, web Origin/double-submit) on the backend.
+6. Root-cause the CodeQL `java-kotlin` autobuild failure.
+7. Prekey rotation policy/automation (none exists yet on either client —
    a published one-time prekey is never replenished, so a contact who
    sends several messages before you're ever online again will exhaust
    your prekey pool and fall back to the non-ratcheted static scheme).
-4. A settings screen — the first real gap `CertPinning.kt`'s
+8. A settings screen — the first real gap `CertPinning.kt`'s
    `resetCertPin()` surfaces: it exists and works, but nothing in the UI
    can call it yet, so a deliberate backend cert rotation currently has
    no in-app recovery path short of clearing app data.
-5. A second pass over the maze's scoring thresholds against real
+9. A second pass over the maze's scoring thresholds against real
    traffic, once there is any.
 
 Deliberately **not** on this list, and why: items like a custom OS
