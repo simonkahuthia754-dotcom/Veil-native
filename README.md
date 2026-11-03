@@ -256,6 +256,40 @@ deleted, so the history of what was fixed and when stays visible.
   updated to match the backend's now-nullable, exactly-one-of shape.
   Android messages no longer leak sender identity to the backend once a
   ratchet session exists, closing the gap flagged above.
+- `[CLOSED]` Three real insider-abuse gaps found by reviewing every
+  `requireAuth` route against what an authenticated-but-malicious caller
+  (a stolen token, or just a bad-faith registered user — not an outside
+  attacker, who never gets this far) could do with it:
+  - **No session revocation existed at all.** A token, once issued,
+    stayed valid forever with no way to kill it from inside the app — a
+    leaked or stolen token (compromised device, captured log, a
+    pentester who got hold of one) was permanent. Fixed:
+    `POST /auth/logout` deletes the caller's own session row (and only
+    the caller's own — verified by a test asserting a second user's
+    token is unaffected).
+  - **Prekey-bundle fetching had no rate limit.** `GET
+    /prekeys/:handle/bundle` atomically consumes one of the target's
+    one-time prekeys per call — the entire point of a one-time prekey.
+    Any authenticated user could silently drain a target's whole pool
+    just by calling this endpoint repeatedly, no message ever sent, no
+    trace the target would see except degraded forward secrecy later.
+    Fixed: `makeBundleLimiter` caps requests per TARGET handle (not per
+    requester — a requester-keyed limit does nothing against the same
+    drain spread across several accounts, since the asset being
+    protected is the target's pool). Checked *before* any prekey is
+    consumed, verified by a test that confirms a blocked request
+    doesn't quietly eat one anyway.
+  - **`POST /messages`' `recipientIds` was unvalidated.** A made-up
+    user id made `better-sqlite3` throw a raw `SQLITE_CONSTRAINT` error
+    from the `messages.recipient_id` foreign key mid-transaction,
+    uncaught — any authenticated caller could trigger a bare 500 at
+    will, with no rate limit beyond the Maze's general scoring.
+    Fixed: ids are checked against real users first, with a clean 400
+    instead. Also capped `recipientIds` at 256 entries, closing a
+    cheap, unbounded per-request DB-write-amplification path the
+    256kb body limit alone didn't prevent (user ids are short; a lot
+    of them still fit).
+  All three verified by new tests in `backend/test/api.test.js`.
 
 **Medium / known and accepted trade-offs, not bugs:**
 - Vault storage is a single AEAD-encrypted file, not SQLCipher, on both

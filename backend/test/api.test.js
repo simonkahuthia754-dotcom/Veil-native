@@ -3,15 +3,20 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { openDb } = require("../src/db");
-const { createApp, makeLoginLimiter } = require("../src/app");
+const { createApp, makeLoginLimiter, makeBundleLimiter } = require("../src/app");
 
 // Real HTTP calls against a real in-memory SQLite DB, not a mocked
 // handler — this is the same "actually run it" discipline as the Rust and
 // Kotlin tests elsewhere in this repo. Each test gets a fresh app + an
-// ephemeral port so tests can't see each other's state.
-async function withServer(t, fn) {
+// ephemeral port so tests can't see each other's state. `appOptions` lets
+// an individual test override createApp's defaults (e.g. a tight
+// bundleLimiter to actually exercise the 429 path without 20 real calls).
+async function withServer(t, fn, appOptions = {}) {
   const db = openDb(":memory:");
-  const app = createApp(db, { loginLimiter: makeLoginLimiter({ maxAttempts: 3, windowMs: 60_000 }) });
+  const app = createApp(db, {
+    loginLimiter: makeLoginLimiter({ maxAttempts: 3, windowMs: 60_000 }),
+    ...appOptions,
+  });
   const server = app.listen(0);
   t.after(() => server.close());
   await new Promise((resolve) => server.once("listening", resolve));
@@ -331,4 +336,117 @@ test("the careers list is static reference data, no auth required", async (t) =>
     assert.ok(Array.isArray(careers));
     assert.ok(careers.includes("Technology"));
   });
+});
+
+test("logout revokes the caller's own token, and nobody else's", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alicelogout", "1234");
+    const bob = await register(base, "boblogout", "5678");
+
+    const logout = await fetch(`${base}/auth/logout`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}` },
+    });
+    assert.equal(logout.status, 200);
+
+    // Alice's own token is now dead.
+    const afterLogout = await fetch(`${base}/chambers`, {
+      headers: { authorization: `Bearer ${alice.token}` },
+    });
+    assert.equal(afterLogout.status, 401);
+
+    // Bob's token is unaffected — logout only revokes the caller's own.
+    const bobStillWorks = await fetch(`${base}/chambers`, {
+      headers: { authorization: `Bearer ${bob.token}` },
+    });
+    assert.equal(bobStillWorks.status, 200);
+  });
+});
+
+test("sending to a nonexistent recipient id fails cleanly with 400, not a raw 500 from the FK constraint", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alicefk", "1234");
+
+    const res = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        recipientIds: ["not-a-real-user-id"],
+        ciphertext: "cipher-blob",
+        nonce: "nonce-blob",
+        senderPubkey: alice.pubkey,
+      }),
+    });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(body.error, /unknown user id/);
+  });
+});
+
+test("recipientIds over the cap is rejected", async (t) => {
+  await withServer(t, async (base) => {
+    const alice = await register(base, "alicecap", "1234");
+    const tooMany = Array.from({ length: 257 }, (_, i) => `id-${i}`);
+
+    const res = await fetch(`${base}/messages`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${alice.token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        recipientIds: tooMany,
+        ciphertext: "cipher-blob",
+        nonce: "nonce-blob",
+        senderPubkey: alice.pubkey,
+      }),
+    });
+    assert.equal(res.status, 400);
+  });
+});
+
+test("repeatedly fetching a victim's prekey bundle to drain their one-time prekeys is rate-limited", async (t) => {
+  await withServer(
+    t,
+    async (base) => {
+      const victim = await register(base, "victim1", "1234");
+      const attacker = await register(base, "attacker1", "5678");
+
+      await fetch(`${base}/prekeys`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${victim.token}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          mediumTermPrekey: { xPub: "mtpk-x", kemPub: "mtpk-kem" },
+          oneTimePrekeys: Array.from({ length: 10 }, (_, i) => ({ xPub: `otpk-x-${i}`, kemPub: `otpk-kem-${i}` })),
+        }),
+      });
+
+      // The test's bundleLimiter below caps this at 2 — the third call
+      // from the SAME or, just as importantly, a DIFFERENT authenticated
+      // requester must still be blocked, since the limiter is keyed by
+      // the victim's handle, not the caller's identity (see
+      // makeBundleLimiter's doc comment on why).
+      const first = await fetch(`${base}/prekeys/victim1/bundle`, {
+        headers: { authorization: `Bearer ${attacker.token}` },
+      });
+      assert.equal(first.status, 200);
+
+      const secondAttacker = await register(base, "attacker2", "9012");
+      const second = await fetch(`${base}/prekeys/victim1/bundle`, {
+        headers: { authorization: `Bearer ${secondAttacker.token}` },
+      });
+      assert.equal(second.status, 200);
+
+      const third = await fetch(`${base}/prekeys/victim1/bundle`, {
+        headers: { authorization: `Bearer ${attacker.token}` },
+      });
+      assert.equal(third.status, 429);
+
+      // Crucially: the blocked request must NOT have consumed a one-time
+      // prekey — the whole point is that the rate limit protects the
+      // pool, not just the HTTP response.
+      const countAfter = await (
+        await fetch(`${base}/prekeys/mine/count`, { headers: { authorization: `Bearer ${victim.token}` } })
+      ).json();
+      assert.equal(countAfter.count, 8); // 10 published - 2 actually consumed
+    },
+    { bundleLimiter: makeBundleLimiter({ maxAttempts: 2, windowMs: 60_000 }) },
+  );
 });

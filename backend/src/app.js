@@ -56,7 +56,62 @@ function makeLoginLimiter({ maxAttempts = 8, windowMs = 15 * 60 * 1000 } = {}) {
   };
 }
 
-function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new maze.ThreatTracker() } = {}) {
+// Generic reusable limiter, same shape as makeLoginLimiter — factored out
+// so GET /prekeys/:handle/bundle (see below) can reuse the identical
+// check/record logic against a different key space (target handle,
+// not requester) without duplicating the Map/resetAt bookkeeping.
+function makeKeyedLimiter({ maxAttempts, windowMs }) {
+  const attempts = new Map(); // key -> { count, resetAt }
+  return {
+    check(key) {
+      const row = attempts.get(key);
+      const now = Date.now();
+      if (!row || now > row.resetAt) return { allowed: true };
+      return { allowed: row.count < maxAttempts, retryAfterMs: row.resetAt - now };
+    },
+    record(key) {
+      const now = Date.now();
+      const row = attempts.get(key);
+      if (!row || now > row.resetAt) {
+        attempts.set(key, { count: 1, resetAt: now + windowMs });
+      } else {
+        row.count += 1;
+      }
+    },
+  };
+}
+
+// Caps how many times ANY requester can fetch a given target's prekey
+// bundle in a window. This is a real insider-abuse fix, not a defensive
+// nicety: GET /prekeys/:handle/bundle atomically consumes (deletes) one of
+// the target's one-time prekeys per call, by design — the whole point of a
+// one-time prekey. Without a cap, any authenticated user (a legitimate
+// account, not an outside attacker — exactly the "fortify the inside"
+// threat model) can silently drain a target's entire one-time-prekey pool
+// just by calling this endpoint repeatedly, with no message ever sent and
+// no trace the target would notice except that future handshakes fall
+// back to the non-ratcheted static scheme once exhausted. Keyed by
+// TARGET handle (not requester) deliberately: a requester-keyed limit
+// would do nothing against an attacker spreading the same drain across
+// several accounts, since the asset being protected is the target's pool,
+// not any one requester's call budget. 20 requests per 10 minutes is
+// generous for legitimate use (one bundle fetch starts a session; a
+// session is then reused for every later message — see
+// VeilSession.kt's send()/cli/src/main.rs's seal_for_one) while still
+// bounding worst-case drain to a small, noticeable multiple of a normal
+// day's handshake volume.
+function makeBundleLimiter({ maxAttempts = 20, windowMs = 10 * 60 * 1000 } = {}) {
+  return makeKeyedLimiter({ maxAttempts, windowMs });
+}
+
+function createApp(
+  db,
+  {
+    loginLimiter = makeLoginLimiter(),
+    bundleLimiter = makeBundleLimiter(),
+    threatTracker = new maze.ThreatTracker(),
+  } = {},
+) {
   const app = express();
   // Trusts exactly one hop of X-Forwarded-For -- correct when this
   // process sits behind exactly one reverse proxy/load balancer doing
@@ -104,6 +159,7 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
     const user = db.prepare("SELECT * FROM users WHERE id = ?").get(session.user_id);
     if (!user) return res.status(401).json({ error: "invalid or expired token" });
     req.user = user;
+    req.token = match[1];
     next();
   }
 
@@ -183,6 +239,20 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
     loginLimiter.recordSuccess(handle);
     const token = issueSession(user.id);
     return res.json(authResponse(user, token));
+  });
+
+  // Real gap closed here, not a nicety: until this existed, a session
+  // token had no revocation path at all — once issued, it was valid
+  // forever (sessions never expire — see the honest note on that
+  // separately), so a leaked or stolen token (a compromised device, a
+  // captured log, a pentester who got hold of one) could never be killed
+  // from inside the app. This only revokes the CALLER's own current
+  // token (the one proven by the bearer header that got them past
+  // requireAuth) — never an arbitrary token by id/value, which would let
+  // one user log another one out.
+  app.post("/auth/logout", requireAuth, (req, res) => {
+    db.prepare("DELETE FROM sessions WHERE token = ?").run(req.token);
+    return res.json({ loggedOut: true });
   });
 
   app.get("/auth/users/:handle", requireAuth, (req, res) => {
@@ -339,11 +409,27 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
   // here; nothing server-side ever inspects or needs to distinguish their
   // contents beyond "which one did the client send."
   const MAX_SENDER_FIELD_LEN = 512; // generous: a real value is ~44 chars (base64 of 32 bytes)
+  // Generous for a real chamber (CHAMBER_CAREERS-style use case never
+  // approaches this) while still bounding per-request DB write
+  // amplification and, more importantly, closing a real bug: without a
+  // cap, an authenticated user could hand this endpoint an enormous
+  // recipientIds array inside the existing 256kb body-size budget
+  // (user ids are short), forcing one request to attempt thousands of
+  // inserts — not a crash, but a real, free amplification an insider
+  // (anyone with a valid token, not an outside attacker) could trigger
+  // with one request.
+  const MAX_RECIPIENTS = 256;
 
   app.post("/messages", requireAuth, (req, res) => {
     const { recipientIds, ciphertext, nonce, senderPubkey, senderTag } = req.body || {};
     if (!Array.isArray(recipientIds) || recipientIds.length === 0) {
       return res.status(400).json({ error: "recipientIds must be a non-empty array" });
+    }
+    if (recipientIds.length > MAX_RECIPIENTS) {
+      return res.status(400).json({ error: `recipientIds exceeds the ${MAX_RECIPIENTS}-recipient limit` });
+    }
+    if (recipientIds.some((id) => typeof id !== "string" || id.length === 0)) {
+      return res.status(400).json({ error: "recipientIds must be non-empty strings" });
     }
     if (typeof ciphertext !== "string" || typeof nonce !== "string") {
       return res.status(400).json({ error: "ciphertext and nonce are required" });
@@ -359,6 +445,26 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
       (hasTag && senderTag.length > MAX_SENDER_FIELD_LEN)
     ) {
       return res.status(400).json({ error: "senderPubkey/senderTag is unreasonably long" });
+    }
+
+    // Real bug closed here, not a defensive nicety: `messages.recipient_id`
+    // has a `REFERENCES users(id)` foreign key, and this db is opened with
+    // `PRAGMA foreign_keys = ON` (db.js). Before this check, a
+    // recipientIds entry that wasn't a real user id made better-sqlite3
+    // throw a raw SQLITE_CONSTRAINT error mid-transaction, which this
+    // route never caught — Express's default error handler would return a
+    // bare 500 (and, depending on NODE_ENV, leak a stack trace) to any
+    // authenticated caller who simply typo'd or probed with a made-up id.
+    // An authenticated-but-malicious caller could trigger that
+    // deliberately, at will, with no rate limit of its own beyond the
+    // Maze's general scoring — closed with a clean, explicit 400 instead.
+    const placeholders = recipientIds.map(() => "?").join(",");
+    const existingIds = new Set(
+      db.prepare(`SELECT id FROM users WHERE id IN (${placeholders})`).all(...recipientIds).map((r) => r.id),
+    );
+    const unknownIds = recipientIds.filter((id) => !existingIds.has(id));
+    if (unknownIds.length > 0) {
+      return res.status(400).json({ error: "recipientIds contains unknown user id(s)" });
     }
 
     const insert = db.prepare(
@@ -469,6 +575,15 @@ function createApp(db, { loginLimiter = makeLoginLimiter(), threatTracker = new 
     const target = authUser(req, req.params.handle);
     if (!target) return res.status(404).json({ error: "no such user" });
 
+    // Checked BEFORE any one-time prekey is looked up/consumed below —
+    // see makeBundleLimiter's doc comment. Keyed by the target's handle,
+    // not the requester, since the pool being protected is the target's.
+    const limit = bundleLimiter.check(target.handle);
+    if (!limit.allowed) {
+      return res.status(429).json({ error: "too many prekey-bundle requests for this user — try again later" });
+    }
+    bundleLimiter.record(target.handle);
+
     const mtpk = db
       .prepare("SELECT * FROM medium_term_prekeys WHERE user_id = ?")
       .get(target.id);
@@ -517,7 +632,7 @@ function start(port = process.env.PORT || 8787, dbPath = process.env.VEIL_DB_PAT
   });
 }
 
-module.exports = { createApp, start, makeLoginLimiter };
+module.exports = { createApp, start, makeLoginLimiter, makeBundleLimiter };
 
 if (require.main === module) {
   start();
