@@ -351,6 +351,21 @@ conflicts with this project's own stated goal:
 **Already done, verified:**
 - Structural senderTag-vs-senderPubkey enforcement by envelope shape
   (the spec's "TASK 4") — see "Closed this pass" below.
+- `[CLOSED]` LICENSE (AGPL-3.0-or-later, see the dedicated "License"
+  section below for why AGPL specifically — and this also *fixed* a real
+  bug: the Rust workspace's `Cargo.toml` previously declared `license =
+  "MIT"` with no LICENSE file anywhere in the repo to back it up, a real
+  inconsistency, not just a missing file) and `SECURITY.md` (private
+  disclosure process, scope, what's already known). One honest gap left
+  in `SECURITY.md` itself, on purpose: its contact address is a visible
+  `<maintainer-security-contact-TODO>` placeholder rather than a
+  silently-inserted personal email — publishing a real contact address
+  to a public repo is the maintainer's call, not mine to make
+  unprompted. **The `v0.1.0` git tag from this item is not yet
+  created** — tagging is a one-way, public action (anyone who already
+  cloned keeps whatever was at that point in history), so it's listed
+  here as prepared, not done, pending confirmation this is the commit to
+  tag.
 
 **Real, scoped, buildable next — folded into the priority list below:**
 - CITY3 (offline/direct transport: QR contact add, file-based message
@@ -358,9 +373,6 @@ conflicts with this project's own stated goal:
   existing envelope with zero new crypto, exactly as proposed.
 - Tor-by-default wiring (CLI warns if `VEIL_SOCKS_PROXY` unset; Android
   defaults to `127.0.0.1:9050` when Orbot's installed) — straightforward.
-- LICENSE (AGPL-3.0) + `SECURITY.md` + a `v0.1.0` tag — pure hygiene, no
-  design risk, does real good (a disclosure contact, a license that
-  actually protects a self-hosted deployment).
 - Deflooder layers 1 (IP: subnet-level banning, proof-of-work header),
   3 (per-device token bucket keyed by `identity_x_public`), and 4 (web:
   Origin/double-submit, endpoint-specific rate limits) — all coherent,
@@ -452,3 +464,23 @@ attempt inside a general "fix everything" pass.
 Push to a GitHub repo with Actions enabled; `rust.yml` and `android.yml` run
 on every push touching their respective directories and upload a debug APK
 as a build artifact on success.
+
+## License
+
+AGPL-3.0-or-later — see [LICENSE](LICENSE). Chosen deliberately, not as
+a default: Veil's threat model already assumes self-hosting (there's no
+single "the Veil server" — `ApiClient.build`'s/the CLI's own doc
+comments), and AGPL's network-use clause (section 13) is what keeps a
+modified backend honest in exactly that scenario — anyone running a
+modified `backend/` for others to use has to offer those users its
+source, not just the people they hand a binary to. A permissive license
+(MIT, which the Rust workspace manifest previously declared before this
+was fixed to match) would have let a modified, backdoored or
+surveillance-added fork of the backend run indefinitely for real users
+with zero disclosure obligation — the opposite of what this project is
+for.
+
+## Reporting a security issue
+
+See [SECURITY.md](SECURITY.md) — please don't open a public issue for a
+vulnerability.

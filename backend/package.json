@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Real REST API for the Veil clients (Rust CLI + Android app) — auth, chambers, message relay, and hybrid-prekey bundles for forward secrecy. Previously this backend only existed as a contract the clients assumed; this is the first real implementation of it.",
+  "license": "AGPL-3.0-or-later",
   "type": "commonjs",
   "main": "src/app.js",
   "scripts": {
