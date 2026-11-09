@@ -1,5 +1,12 @@
 # Veil — chambers backend + native clients + web frontend
 
+**🚧 Work in progress — not production-ready.** No independent security
+audit, no production users, and the "Honest gaps" section below lists
+real, unresolved limitations (including crypto surfaces that are
+scaffolded but not yet proven). Treat everything here as a prototype
+under active development, not a finished product — see "Honest gaps"
+before trusting it with anything sensitive.
+
 A full-stack implementation, not just clients: a real Express/SQLite
 backend (`backend/`), two independent native clients — a Rust CLI
 (`cli/`, built on `veil-crypto/`) and an Android app (`android/`) — and a
