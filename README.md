@@ -221,6 +221,21 @@ deleted, so the history of what was fixed and when stays visible.
   already assumed, CI-tested (`backend/test/`).
 
 **Closed this pass:**
+- `[CLOSED]` Replaced the scaffold app icon (a literal placeholder ring —
+  the vector drawable's own comment said "swap before a store release")
+  with real art: a neon shield-and-padlock mark on a near-black ground.
+  Android's adaptive icon now has a proper foreground/background split
+  (`ic_launcher_foreground.png` generated per-density by converting the
+  art's black backing to transparency via luminance so it composites
+  cleanly onto `ic_launcher_background`'s solid color with no seam, and
+  scaled so the mark sits inside the 66/108dp safe zone — it survives
+  circle/squircle/rounded-square masking on any launcher), plus a real
+  round-icon variant and legacy `mipmap-*` fallbacks for pre-API26
+  devices (there were none before — a real gap, not just a cosmetic
+  one). Also added: a 512×512 Play Store listing icon (`android/store/`)
+  and a full web favicon set (`frontend/icons/` — 16/32px, Apple
+  touch-icon, 192/512 PWA-style sizes, `favicon.ico`) wired into
+  `frontend/index.html`'s `<head>`.
 - `[CLOSED]` The backend used to see every sender's real, long-term
   identity key in plaintext on every single message (`sender_pubkey`,
   `NOT NULL`) — including for messages on an already-established
