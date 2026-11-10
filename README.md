@@ -236,6 +236,28 @@ deleted, so the history of what was fixed and when stays visible.
   and a full web favicon set (`frontend/icons/` — 16/32px, Apple
   touch-icon, 192/512 PWA-style sizes, `favicon.ico`) wired into
   `frontend/index.html`'s `<head>`.
+- `[CLOSED]` Rebuilt the Android UI's visual language to match the real
+  icon instead of a leftover placeholder: the hot-pink "SIGNAL" accent
+  (named after the vector placeholder ring it was introduced alongside)
+  is gone, replaced with a VIOLET primary / GREEN secondary pair lifted
+  from the icon's own palette, and a separate ERROR red — previously
+  error text (e.g. "Wrong passphrase") and the brand title rendered in
+  the *identical* pink, a real legibility/semantics bug, not just a
+  style choice. The "Veil" wordmark on the lock screen now renders as a
+  violet-to-green gradient. Added a short cross-fade between screens
+  (`NavHost`'s `enterTransition`/`exitTransition`, `androidx.compose.
+  animation`) instead of the default hard cut. More substantively: both
+  `ChambersScreen` and `ChatScreen` previously had no loading state at
+  all — a request in flight and a genuinely-empty result looked
+  identical (a bare, empty list), which is a real blank-screen bug, not
+  a missing animation. Both now track `loading` separately and show a
+  spinner while fetching, then a distinct "No chambers yet." / "No
+  messages waiting." empty state only once the fetch has actually
+  finished. Couldn't be compiled locally — this sandbox has no network
+  path to the Google/Maven plugin repositories (`gradle --offline`
+  confirms it, same root cause as the npm/crates.io gaps elsewhere in
+  this doc) — so, as with everything else in `android/`, `android.yml`
+  CI is the real verification, not a local build.
 - `[CLOSED]` The backend used to see every sender's real, long-term
   identity key in plaintext on every single message (`sender_pubkey`,
   `NOT NULL`) — including for messages on an already-established

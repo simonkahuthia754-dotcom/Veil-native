@@ -48,6 +48,13 @@ dependencies {
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.ui:ui-tooling-preview")
+    // Version comes from the compose-bom platform import above, same as
+    // the other androidx.compose.* lines. Material3 already pulls this in
+    // transitively, but VeilApp.kt now calls its fadeIn/fadeOut directly
+    // for screen transitions, so it's declared explicitly rather than
+    // relying on something else's transitive dependency to keep providing
+    // it.
+    implementation("androidx.compose.animation:animation")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
     implementation("androidx.navigation:navigation-compose:2.7.7")
 

@@ -1,5 +1,8 @@
 package com.veil.app.ui
 
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -9,6 +12,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -22,18 +26,44 @@ import com.veil.app.net.ApiClient
 import com.veil.app.net.Chamber
 import com.veil.app.state.VeilSession
 
+// The palette matches the real app icon (a violet-draped, green-outlined
+// shield-and-padlock mark on near-black) instead of the unrelated hot-pink
+// "SIGNAL" color the UI used while the icon itself was still a placeholder
+// ring. VIOLET is the brand/primary accent (titles, primary buttons);
+// GREEN is a secondary accent for positive/active state (the same role the
+// lock-icon outline plays in the mark itself); ERROR is now its own real
+// color — previously error text reused the brand accent color, so a wrong
+// passphrase message and the "Veil" title rendered in the identical pink,
+// which is a real (if small) legibility/semantics bug, not just a style
+// choice.
 private val BG = Color(0xFF07050E)
 private val PANEL = Color(0xFF1A122A)
 private val FG = Color(0xFFFBF8FF)
 private val MUTED = Color(0xFF9C8BC2)
-private val SIGNAL = Color(0xFFFF3FA4)
+private val VIOLET = Color(0xFF9B6BFF)
+private val GREEN = Color(0xFF4CFFB0)
+private val ERROR = Color(0xFFFF5370)
+private val BRAND_GRADIENT = Brush.horizontalGradient(listOf(VIOLET, GREEN))
 
 @Composable
 fun VeilApp(session: VeilSession) {
     val nav = rememberNavController()
-    MaterialTheme(colorScheme = darkColorScheme(background = BG, surface = PANEL, primary = SIGNAL, onBackground = FG, onSurface = FG)) {
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            background = BG, surface = PANEL, primary = VIOLET, secondary = GREEN,
+            error = ERROR, onBackground = FG, onSurface = FG,
+        ),
+    ) {
         Surface(color = BG, modifier = Modifier.fillMaxSize()) {
-            NavHost(navController = nav, startDestination = if (session.isLockSet()) "lock" else "setup") {
+            NavHost(
+                navController = nav,
+                startDestination = if (session.isLockSet()) "lock" else "setup",
+                // Cheap, real polish: a quick cross-fade instead of the
+                // default hard cut between screens. Kept short (180ms) so
+                // it reads as responsive, not slow.
+                enterTransition = { fadeIn(tween(180)) },
+                exitTransition = { fadeOut(tween(120)) },
+            ) {
                 composable("setup") { SetupScreen(session) { nav.navigate("lock") { popUpTo("setup") { inclusive = true } } } }
                 composable("lock") {
                     LockScreen(session) {
@@ -81,7 +111,7 @@ private fun SetupScreen(session: VeilSession, onDone: () -> Unit) {
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             modifier = Modifier.fillMaxWidth(),
         )
-        error?.let { Text(it, color = SIGNAL, modifier = Modifier.padding(top = 8.dp)) }
+        error?.let { Text(it, color = ERROR, modifier = Modifier.padding(top = 8.dp)) }
         Spacer(Modifier.height(20.dp))
         Button(onClick = {
             when {
@@ -108,7 +138,10 @@ private fun LockScreen(session: VeilSession, onUnlocked: () -> Unit) {
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text("Veil", color = SIGNAL, style = MaterialTheme.typography.displaySmall)
+        Text(
+            "Veil",
+            style = MaterialTheme.typography.displaySmall.copy(brush = BRAND_GRADIENT),
+        )
         Spacer(Modifier.height(32.dp))
         OutlinedTextField(
             value = pass, onValueChange = { pass = it }, label = { Text("Passphrase") },
@@ -197,7 +230,7 @@ private fun AccountScreen(session: VeilSession, onDone: () -> Unit) {
             enabled = !busy,
             modifier = Modifier.fillMaxWidth(),
         )
-        error?.let { Text(it, color = SIGNAL, modifier = Modifier.padding(top = 8.dp)) }
+        error?.let { Text(it, color = ERROR, modifier = Modifier.padding(top = 8.dp)) }
         Spacer(Modifier.height(20.dp))
         Button(onClick = { submit() }, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
             Text(if (busy) "Working…" else if (mode) "Register" else "Log in")
@@ -211,32 +244,48 @@ private fun AccountScreen(session: VeilSession, onDone: () -> Unit) {
 
 @Composable
 private fun ChambersScreen(session: VeilSession, nav: NavHostController) {
+    // `loading` is its own state, distinct from "chambers came back empty" —
+    // previously both looked identical (a bare LazyColumn with nothing in
+    // it), so a real account with zero chambers and a request still in
+    // flight were visually indistinguishable. That's the blank-screen
+    // problem a spinner here actually fixes, not just decoration.
     var chambers by remember { mutableStateOf<List<Chamber>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         session.listChambers(
-            onSuccess = { chambers = it },
-            onError = { error = it },
+            onSuccess = { chambers = it; loading = false },
+            onError = { error = it; loading = false },
         )
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Chambers", color = FG, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(bottom = 16.dp))
-        error?.let { Text(it, color = SIGNAL) }
-        LazyColumn {
-            items(chambers) { chamber ->
-                Surface(
-                    color = PANEL,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp),
-                ) {
-                    TextButton(
-                        onClick = { nav.navigate("chat/${chamber.id}") },
-                        modifier = Modifier.fillMaxWidth().padding(8.dp),
+        error?.let { Text(it, color = ERROR) }
+        when {
+            loading -> Box(Modifier.fillMaxWidth().padding(top = 32.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator(color = VIOLET)
+            }
+            chambers.isEmpty() && error == null -> Text(
+                "No chambers yet.",
+                color = MUTED,
+                modifier = Modifier.padding(top = 16.dp),
+            )
+            else -> LazyColumn {
+                items(chambers) { chamber ->
+                    Surface(
+                        color = PANEL,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
                     ) {
-                        Text(chamber.name, color = FG, modifier = Modifier.fillMaxWidth())
+                        TextButton(
+                            onClick = { nav.navigate("chat/${chamber.id}") },
+                            modifier = Modifier.fillMaxWidth().padding(8.dp),
+                        ) {
+                            Text(chamber.name, color = FG, modifier = Modifier.fillMaxWidth())
+                        }
                     }
                 }
             }
@@ -247,16 +296,25 @@ private fun ChambersScreen(session: VeilSession, nav: NavHostController) {
 @Composable
 private fun ChatScreen(session: VeilSession, chamberId: String) {
     var messages by remember { mutableStateOf(listOf<String>()) }
+    var loading by remember { mutableStateOf(true) }
     var draft by remember { mutableStateOf("") }
 
     LaunchedEffect(chamberId) {
-        session.loadInbox(onSuccess = { messages = it }, onError = {})
+        session.loadInbox(onSuccess = { messages = it; loading = false }, onError = { loading = false })
     }
 
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Box(Modifier.weight(1f).fillMaxWidth().background(BG)) {
-            LazyColumn {
-                items(messages) { m -> Text(m, color = FG, modifier = Modifier.padding(6.dp)) }
+            when {
+                loading -> CircularProgressIndicator(color = VIOLET, modifier = Modifier.align(Alignment.Center))
+                messages.isEmpty() -> Text(
+                    "No messages waiting.",
+                    color = MUTED,
+                    modifier = Modifier.align(Alignment.Center),
+                )
+                else -> LazyColumn {
+                    items(messages) { m -> Text(m, color = FG, modifier = Modifier.padding(6.dp)) }
+                }
             }
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp)) {
